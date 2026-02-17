@@ -351,7 +351,7 @@ describe('Proxy OpenAI API', () => {
         expect(res.body.output[0].arguments).toContain('Rome');
     });
 
-    test('POST /v1/responses deve ignorar instrução de tools para user-agent do LangChain', async () => {
+    test('POST /v1/responses deve manter instrução de tools para user-agent do LangChain', async () => {
         const res = await request(app)
             .post('/v1/responses')
             .set('Authorization', 'Bearer test-password')
@@ -364,7 +364,7 @@ describe('Proxy OpenAI API', () => {
 
         expect(res.statusCode).toEqual(200);
         expect(res.body.output[0].type).toEqual('message');
-        expect(res.body.output[0].content[0].text).toEqual('proxy-policy-bypassed');
+        expect(res.body.output[0].content[0].text).toEqual('proxy-policy-applied');
     });
 
     test('POST /v1/responses deve manter instrução de tools para user-agent não LangChain', async () => {
