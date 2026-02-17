@@ -523,7 +523,7 @@ describe('Proxy OpenAI API', () => {
         expect(resume.body.output[0].type).toEqual('message');
     });
 
-    test('POST /v1/responses deve rejeitar reenvio duplicado de function_call_output', async () => {
+    test('POST /v1/responses deve tratar reenvio duplicado de function_call_output como idempotente', async () => {
         const first = await request(app)
             .post('/v1/responses')
             .set('Authorization', 'Bearer test-password')
@@ -561,9 +561,9 @@ describe('Proxy OpenAI API', () => {
                 }]
             });
 
-        expect(duplicate.statusCode).toEqual(400);
-        expect(duplicate.body.error.type).toEqual('invalid_request_error');
-        expect(duplicate.body.error.message).toContain('already submitted');
+        expect(duplicate.statusCode).toEqual(200);
+        expect(duplicate.body.object).toEqual('response');
+        expect(duplicate.body.output[0].type).toEqual('message');
     });
 
     test('POST /v1/responses deve suportar parallel_tool_calls=true com múltiplos function calls', async () => {

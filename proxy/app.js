@@ -576,11 +576,12 @@ function resolveFunctionCallOutputTargets(functionCallOutputs, explicitPreviousR
 
 function validateFunctionCallOutputs(functionCallOutputs, ownershipByCallId) {
     if (functionCallOutputs.length === 0) {
-        return { validOutputs: [] };
+        return { actionableOutputs: [], alreadyCompletedOutputs: [] };
     }
 
     const seen = new Set();
-    const validOutputs = [];
+    const actionableOutputs = [];
+    const alreadyCompletedOutputs = [];
 
     for (const outputItem of functionCallOutputs) {
         if (seen.has(outputItem.call_id)) {
@@ -604,22 +605,22 @@ function validateFunctionCallOutputs(functionCallOutputs, ownershipByCallId) {
         }
 
         if (ownership.call.status === 'completed') {
-            return {
-                error: {
-                    message: `function_call_output already submitted for call_id: ${outputItem.call_id}`,
-                    type: 'invalid_request_error'
-                }
-            };
+            alreadyCompletedOutputs.push({
+                output: outputItem,
+                call: ownership.call,
+                ownerResponseId: ownership.responseId
+            });
+            continue;
         }
 
-        validOutputs.push({
+        actionableOutputs.push({
             output: outputItem,
             call: ownership.call,
             ownerResponseId: ownership.responseId
         });
     }
 
-    return { validOutputs };
+    return { actionableOutputs, alreadyCompletedOutputs };
 }
 
 function toToolResultString(output) {
@@ -1094,7 +1095,7 @@ app.post('/v1/responses', async (req, res) => {
         if (continuationValidation.error) {
             return res.status(400).json({ error: continuationValidation.error });
         }
-        const validatedFunctionCallOutputs = continuationValidation.validOutputs;
+        const actionableFunctionCallOutputs = continuationValidation.actionableOutputs;
 
         const selectedModel = model || previousState?.model || 'opencode/big-pickle';
         const { providerId, modelId } = parseModel(selectedModel);
@@ -1120,43 +1121,47 @@ app.post('/v1/responses', async (req, res) => {
         }
 
         let normalizedInput = input;
-        if (validatedFunctionCallOutputs.length > 0) {
+        if (functionCallOutputs.length > 0) {
             const passthroughItems = Array.isArray(input)
                 ? input.filter((item) => item?.type !== 'function_call_output')
                 : [];
 
-            const toolOutputMessages = validatedFunctionCallOutputs.map(({ output, call }) => {
-                return {
-                    role: 'user',
-                    content: `Tool output for ${call.name} (${output.call_id}): ${toToolResultString(output.output)}`
-                };
-            });
+            normalizedInput = passthroughItems;
 
-            normalizedInput = [...passthroughItems, ...toolOutputMessages];
+            if (actionableFunctionCallOutputs.length > 0) {
+                const toolOutputMessages = actionableFunctionCallOutputs.map(({ output, call }) => {
+                    return {
+                        role: 'user',
+                        content: `Tool output for ${call.name} (${output.call_id}): ${toToolResultString(output.output)}`
+                    };
+                });
 
-            const resolvedByOwner = new Map();
-            for (const { ownerResponseId, output } of validatedFunctionCallOutputs) {
-                const resolvedSet = resolvedByOwner.get(ownerResponseId) || new Set();
-                resolvedSet.add(output.call_id);
-                resolvedByOwner.set(ownerResponseId, resolvedSet);
-            }
+                normalizedInput = [...passthroughItems, ...toolOutputMessages];
 
-            for (const [ownerResponseId, resolvedCallIds] of resolvedByOwner.entries()) {
-                const ownerState = getResponseState(ownerResponseId);
-                if (!ownerState) {
-                    continue;
+                const resolvedByOwner = new Map();
+                for (const { ownerResponseId, output } of actionableFunctionCallOutputs) {
+                    const resolvedSet = resolvedByOwner.get(ownerResponseId) || new Set();
+                    resolvedSet.add(output.call_id);
+                    resolvedByOwner.set(ownerResponseId, resolvedSet);
                 }
 
-                const updatedPendingToolCalls = (ownerState.pendingToolCalls || []).map((call) => {
-                    return resolvedCallIds.has(call.call_id)
-                        ? { ...call, status: 'completed' }
-                        : call;
-                });
+                for (const [ownerResponseId, resolvedCallIds] of resolvedByOwner.entries()) {
+                    const ownerState = getResponseState(ownerResponseId);
+                    if (!ownerState) {
+                        continue;
+                    }
 
-                storeResponseState(ownerResponseId, {
-                    ...ownerState,
-                    pendingToolCalls: updatedPendingToolCalls
-                });
+                    const updatedPendingToolCalls = (ownerState.pendingToolCalls || []).map((call) => {
+                        return resolvedCallIds.has(call.call_id)
+                            ? { ...call, status: 'completed' }
+                            : call;
+                    });
+
+                    storeResponseState(ownerResponseId, {
+                        ...ownerState,
+                        pendingToolCalls: updatedPendingToolCalls
+                    });
+                }
             }
         }
 
@@ -1168,6 +1173,36 @@ app.post('/v1/responses', async (req, res) => {
         }
 
         if (messages.length === 0) {
+            if (functionCallOutputs.length > 0 && actionableFunctionCallOutputs.length === 0) {
+                const createdAt = Math.floor(Date.now() / 1000);
+                const responseId = createId('resp');
+                const outputMessageId = createId('msg');
+
+                return res.json({
+                    id: responseId,
+                    object: 'response',
+                    created_at: createdAt,
+                    status: 'completed',
+                    model: `${providerId}/${modelId}`,
+                    output: [{
+                        id: outputMessageId,
+                        type: 'message',
+                        role: 'assistant',
+                        status: 'completed',
+                        content: [{ type: 'output_text', text: '' }]
+                    }],
+                    output_text: '',
+                    parallel_tool_calls: parallelToolCalls === true,
+                    usage: {
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        total_tokens: 0,
+                        output_tokens_details: { reasoning_tokens: 0 }
+                    },
+                    error: null
+                });
+            }
+
             return res.status(400).json({
                 error: {
                     message: 'input is required when no usable previous_response_id context is provided',
