@@ -50,6 +50,17 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
                     };
                 }
 
+                if (promptText.includes('Use weather and time tool') && !promptText.includes('Tool output for')) {
+                    return {
+                        data: {
+                            parts: [{
+                                type: 'text',
+                                text: '{"tool_calls":[{"name":"weather","arguments":{"city":"Rome"}},{"name":"time","arguments":{"city":"Rome"}}]}'
+                            }]
+                        }
+                    };
+                }
+
                 if (promptText.includes('Tool output for weather')) {
                     return {
                         data: {
@@ -72,10 +83,15 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
         event: {
             subscribe: jest.fn(async () => {
                 const sessionId = 'test-session-id';
-                const mockEvents = lastPromptText.includes('Use weather tool') && !lastPromptText.includes('Tool output for weather')
+                const shouldEmitToolCalls = (lastPromptText.includes('Use weather tool') || lastPromptText.includes('Use weather and time tool'))
+                    && !lastPromptText.includes('Tool output for weather');
+
+                const mockEvents = shouldEmitToolCalls
                     ? [
                         { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: sessionId }, delta: '{"tool_calls":[' } },
-                        { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: sessionId }, delta: '{"name":"weather","arguments":{"city":"Rome"}}]}' } },
+                        { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: sessionId }, delta: lastPromptText.includes('Use weather and time tool')
+                            ? '{"name":"weather","arguments":{"city":"Rome"}},{"name":"time","arguments":{"city":"Rome"}}]}'
+                            : '{"name":"weather","arguments":{"city":"Rome"}}]}' } },
                         { type: 'message.updated', properties: { info: { sessionID: sessionId, finish: 'stop' } } }
                     ]
                     : [
@@ -100,6 +116,14 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
 
 // Importa o app dinamicamente para que o mock seja aplicado
 const { default: app } = await import('../app.js');
+
+function parseSseEvents(bodyText) {
+    return bodyText
+        .split('\n\n')
+        .map((chunk) => chunk.trim())
+        .filter((chunk) => chunk.startsWith('data: ') && chunk !== 'data: [DONE]')
+        .map((chunk) => JSON.parse(chunk.slice('data: '.length)));
+}
 
 describe('Proxy OpenAI API', () => {
     const originalEnv = process.env;
@@ -307,8 +331,26 @@ describe('Proxy OpenAI API', () => {
         expect(res.statusCode).toEqual(200);
         expect(res.body.object).toEqual('response');
         expect(res.body.output[0].type).toEqual('function_call');
+        expect(res.body.output[0].id).toMatch(/^fc_/);
+        expect(res.body.output[0].call_id).toMatch(/^call_/);
         expect(res.body.output[0].name).toEqual('weather');
         expect(res.body.output[0].arguments).toContain('Rome');
+    });
+
+    test('POST /v1/responses deve falhar explicitamente quando tool_choice=required não gera tool call', async () => {
+        const res = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                model: 'opencode/gpt-5-nano',
+                input: 'Pergunta sem chamada de ferramenta',
+                tool_choice: 'required',
+                tools: [{ type: 'function', function: { name: 'weather', parameters: { type: 'object' } } }]
+            });
+
+        expect(res.statusCode).toEqual(500);
+        expect(res.body.error.type).toEqual('invalid_response_error');
+        expect(res.body.error.message).toContain('required function call');
     });
 
     test('POST /v1/responses deve aceitar function_call_output e continuar a resposta', async () => {
@@ -341,7 +383,123 @@ describe('Proxy OpenAI API', () => {
         expect(second.body.output[0].content[0].text).toContain('sunny');
     });
 
+    test('POST /v1/responses deve rejeitar function_call_output com call_id desconhecido', async () => {
+        const first = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                model: 'opencode/gpt-5-nano',
+                input: 'Use weather tool',
+                tools: [{ type: 'function', function: { name: 'weather', parameters: { type: 'object' } } }]
+            });
+
+        expect(first.statusCode).toEqual(200);
+
+        const second = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                previous_response_id: first.body.id,
+                input: [{
+                    type: 'function_call_output',
+                    call_id: 'call_unknown',
+                    output: { weather: 'sunny' }
+                }]
+            });
+
+        expect(second.statusCode).toEqual(400);
+        expect(second.body.error.type).toEqual('invalid_request_error');
+        expect(second.body.error.message).toContain('Unknown function_call_output call_id');
+    });
+
+    test('POST /v1/responses deve rejeitar reenvio duplicado de function_call_output', async () => {
+        const first = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                model: 'opencode/gpt-5-nano',
+                input: 'Use weather tool',
+                tools: [{ type: 'function', function: { name: 'weather', parameters: { type: 'object' } } }]
+            });
+
+        const callId = first.body.output[0].call_id;
+
+        const submit = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                previous_response_id: first.body.id,
+                input: [{
+                    type: 'function_call_output',
+                    call_id: callId,
+                    output: { weather: 'sunny' }
+                }]
+            });
+
+        expect(submit.statusCode).toEqual(200);
+
+        const duplicate = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                previous_response_id: first.body.id,
+                input: [{
+                    type: 'function_call_output',
+                    call_id: callId,
+                    output: { weather: 'cloudy' }
+                }]
+            });
+
+        expect(duplicate.statusCode).toEqual(400);
+        expect(duplicate.body.error.type).toEqual('invalid_request_error');
+        expect(duplicate.body.error.message).toContain('already submitted');
+    });
+
+    test('POST /v1/responses deve suportar parallel_tool_calls=true com múltiplos function calls', async () => {
+        const res = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                model: 'opencode/gpt-5-nano',
+                input: 'Use weather and time tool',
+                parallel_tool_calls: true,
+                tools: [
+                    { type: 'function', function: { name: 'weather', parameters: { type: 'object' } } },
+                    { type: 'function', function: { name: 'time', parameters: { type: 'object' } } }
+                ]
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.body.output).toHaveLength(2);
+        expect(new Set(res.body.output.map((item) => item.call_id)).size).toEqual(2);
+        expect(new Set(res.body.output.map((item) => item.id)).size).toEqual(2);
+    });
+
+    test('POST /v1/responses deve rejeitar ferramentas built-in não suportadas', async () => {
+        const res = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                model: 'opencode/gpt-5-nano',
+                input: 'Search web',
+                tools: [{ type: 'web_search' }]
+            });
+
+        expect(res.statusCode).toEqual(400);
+        expect(res.body.error.type).toEqual('invalid_request_error');
+        expect(res.body.error.message).toContain('Unsupported built-in tool type');
+    });
+
     test('POST /v1/responses stream deve emitir eventos de function call', async () => {
+        const nonStream = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                model: 'opencode/gpt-5-nano',
+                input: 'Use weather tool',
+                tools: [{ type: 'function', function: { name: 'weather', parameters: { type: 'object' } } }]
+            });
+
         const res = await request(app)
             .post('/v1/responses')
             .set('Authorization', 'Bearer test-password')
@@ -359,5 +517,18 @@ describe('Proxy OpenAI API', () => {
         expect(res.text).toContain('"type":"response.function_call_arguments.done"');
         expect(res.text).toContain('"type":"response.completed"');
         expect(res.text).toContain('data: [DONE]');
+
+        const events = parseSseEvents(res.text);
+        const functionCallDoneEvent = events.find((event) => event.type === 'response.output_item.done' && event.item?.type === 'function_call');
+
+        expect(functionCallDoneEvent).toBeDefined();
+        expect(functionCallDoneEvent.item).toMatchObject({
+            type: nonStream.body.output[0].type,
+            name: nonStream.body.output[0].name,
+            arguments: nonStream.body.output[0].arguments,
+            status: nonStream.body.output[0].status
+        });
+        expect(typeof functionCallDoneEvent.item.id).toEqual('string');
+        expect(typeof functionCallDoneEvent.item.call_id).toEqual('string');
     });
 });

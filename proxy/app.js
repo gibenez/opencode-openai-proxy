@@ -2,6 +2,7 @@ import express from 'express';
 import bodyParser from 'body-parser';
 import cors from 'cors';
 import axios from 'axios';
+import { randomUUID } from 'node:crypto';
 import { createOpencodeClient } from '@opencode-ai/sdk';
 
 const app = express();
@@ -244,6 +245,10 @@ function sendResponseSseEvent(res, payload) {
     res.write(`data: ${JSON.stringify(payload)}\n\n`);
 }
 
+function createId(prefix) {
+    return `${prefix}_${randomUUID().replace(/-/g, '')}`;
+}
+
 function normalizeToolChoice(toolChoice) {
     if (toolChoice === undefined || toolChoice === null) {
         return { mode: 'auto' };
@@ -264,17 +269,53 @@ function normalizeToolChoice(toolChoice) {
 }
 
 function normalizeTools(tools) {
-    if (!Array.isArray(tools)) {
-        return [];
+    if (tools === undefined || tools === null) {
+        return { tools: [] };
     }
 
-    return tools
-        .filter((tool) => tool?.type === 'function' && tool.function?.name)
-        .map((tool) => ({
-            name: tool.function.name,
-            description: tool.function.description || '',
-            parameters: tool.function.parameters || { type: 'object', properties: {} }
-        }));
+    if (!Array.isArray(tools)) {
+        return {
+            tools: [],
+            error: 'tools must be an array when provided'
+        };
+    }
+
+    const normalized = [];
+    for (const tool of tools) {
+        if (!tool || typeof tool !== 'object') {
+            continue;
+        }
+
+        if (tool.type === 'function') {
+            if (!tool.function?.name) {
+                return {
+                    tools: [],
+                    error: 'Function tools must include function.name'
+                };
+            }
+
+            normalized.push({
+                name: tool.function.name,
+                description: tool.function.description || '',
+                parameters: tool.function.parameters || { type: 'object', properties: {} }
+            });
+            continue;
+        }
+
+        if (tool.type === 'web_search' || tool.type === 'file_search' || tool.type === 'code_interpreter') {
+            return {
+                tools: [],
+                error: `Unsupported built-in tool type: ${tool.type}`
+            };
+        }
+
+        return {
+            tools: [],
+            error: `Unsupported tool type: ${tool.type || 'unknown'}`
+        };
+    }
+
+    return { tools: normalized };
 }
 
 function buildToolSystemInstruction(tools, toolChoice, parallelToolCalls) {
@@ -310,47 +351,93 @@ function buildToolSystemInstruction(tools, toolChoice, parallelToolCalls) {
 
 function extractToolCallsFromText(text) {
     if (!text || typeof text !== 'string') {
-        return [];
+        return { toolCalls: [], malformed: false };
     }
 
-    const candidates = [text.trim()];
+    const trimmed = text.trim();
+    const candidates = [trimmed];
     const fenced = text.match(/```json\s*([\s\S]*?)\s*```/i);
     if (fenced && fenced[1]) {
         candidates.push(fenced[1].trim());
     }
 
+    const mentionsToolCalls = /"tool_calls"|"tool_call"/i.test(text);
+    const maybeJson = mentionsToolCalls || /^\s*[\[{]/.test(trimmed) || Boolean(fenced?.[1]);
+    let malformed = false;
+
     for (const candidate of candidates) {
-        try {
-            const parsed = JSON.parse(candidate);
-            const rawCalls = Array.isArray(parsed?.tool_calls)
-                ? parsed.tool_calls
-                : parsed?.tool_call
-                    ? [parsed.tool_call]
-                    : [];
-
-            const normalized = rawCalls
-                .filter((call) => call?.name)
-                .map((call, index) => {
-                    const argsObj = typeof call.arguments === 'string'
-                        ? JSON.parse(call.arguments)
-                        : (call.arguments || {});
-
-                    return {
-                        id: call.call_id || `call_${Date.now()}_${index}`,
-                        name: call.name,
-                        arguments: JSON.stringify(argsObj)
-                    };
-                });
-
-            if (normalized.length) {
-                return normalized;
-            }
-        } catch (error) {
+        if (!candidate) {
             continue;
+        }
+
+        let parsed;
+        try {
+            parsed = JSON.parse(candidate);
+        } catch (error) {
+            malformed = malformed || mentionsToolCalls;
+            continue;
+        }
+
+        const hasToolCallField = Object.prototype.hasOwnProperty.call(parsed || {}, 'tool_calls')
+            || Object.prototype.hasOwnProperty.call(parsed || {}, 'tool_call');
+
+        const rawCalls = Array.isArray(parsed?.tool_calls)
+            ? parsed.tool_calls
+            : parsed?.tool_call
+                ? [parsed.tool_call]
+                : [];
+
+        if (hasToolCallField && !rawCalls.length) {
+            malformed = true;
+            continue;
+        }
+
+        if (!rawCalls.length) {
+            continue;
+        }
+
+        const normalized = [];
+        let invalidCall = false;
+
+        for (const call of rawCalls) {
+            if (!call || typeof call !== 'object' || typeof call.name !== 'string' || !call.name.trim()) {
+                invalidCall = true;
+                break;
+            }
+
+            let argsObj = call.arguments;
+            if (typeof argsObj === 'string') {
+                try {
+                    argsObj = JSON.parse(argsObj);
+                } catch (error) {
+                    invalidCall = true;
+                    break;
+                }
+            }
+
+            if (!argsObj || typeof argsObj !== 'object' || Array.isArray(argsObj)) {
+                invalidCall = true;
+                break;
+            }
+
+            normalized.push({
+                call_id: typeof call.call_id === 'string' && call.call_id.trim() ? call.call_id : createId('call'),
+                name: call.name,
+                arguments: JSON.stringify(argsObj)
+            });
+        }
+
+        if (invalidCall) {
+            malformed = true;
+            continue;
+        }
+
+        if (normalized.length) {
+            return { toolCalls: normalized, malformed: false };
         }
     }
 
-    return [];
+    return { toolCalls: [], malformed: malformed && maybeJson };
 }
 
 function extractFunctionCallOutputs(input) {
@@ -359,6 +446,87 @@ function extractFunctionCallOutputs(input) {
     }
 
     return input.filter((item) => item?.type === 'function_call_output' && item.call_id);
+}
+
+function buildFunctionCallOutputItems(toolCalls, pendingByCallId = new Map()) {
+    return toolCalls.map((toolCall) => {
+        const pending = pendingByCallId.get(toolCall.call_id);
+        const itemId = pending?.item_id || createId('fc');
+        return {
+            id: itemId,
+            type: 'function_call',
+            call_id: toolCall.call_id,
+            name: toolCall.name,
+            arguments: toolCall.arguments,
+            status: 'completed'
+        };
+    });
+}
+
+function validateFunctionCallOutputs(functionCallOutputs, previousResponseId, previousState) {
+    if (functionCallOutputs.length === 0) {
+        return { validOutputs: [] };
+    }
+
+    if (!previousResponseId) {
+        return {
+            error: {
+                message: 'function_call_output requires previous_response_id',
+                type: 'invalid_request_error'
+            }
+        };
+    }
+
+    if (!previousState) {
+        return {
+            error: {
+                message: 'function_call_output requires a valid previous_response_id',
+                type: 'invalid_request_error'
+            }
+        };
+    }
+
+    const seen = new Set();
+    const callStateById = new Map((previousState.pendingToolCalls || []).map((call) => [call.call_id, call]));
+    const validOutputs = [];
+
+    for (const outputItem of functionCallOutputs) {
+        if (seen.has(outputItem.call_id)) {
+            return {
+                error: {
+                    message: `Duplicate function_call_output call_id in request: ${outputItem.call_id}`,
+                    type: 'invalid_request_error'
+                }
+            };
+        }
+        seen.add(outputItem.call_id);
+
+        const callState = callStateById.get(outputItem.call_id);
+        if (!callState) {
+            return {
+                error: {
+                    message: `Unknown function_call_output call_id: ${outputItem.call_id}`,
+                    type: 'invalid_request_error'
+                }
+            };
+        }
+
+        if (callState.status === 'completed') {
+            return {
+                error: {
+                    message: `function_call_output already submitted for call_id: ${outputItem.call_id}`,
+                    type: 'invalid_request_error'
+                }
+            };
+        }
+
+        validOutputs.push({
+            output: outputItem,
+            call: callState
+        });
+    }
+
+    return { validOutputs };
 }
 
 function toToolResultString(output) {
@@ -760,7 +928,17 @@ app.post('/v1/responses', async (req, res) => {
             parallel_tool_calls: parallelToolCalls
         } = req.body || {};
 
-        const normalizedTools = normalizeTools(tools);
+        const normalizedToolsResult = normalizeTools(tools);
+        if (normalizedToolsResult.error) {
+            return res.status(400).json({
+                error: {
+                    message: normalizedToolsResult.error,
+                    type: 'invalid_request_error'
+                }
+            });
+        }
+
+        const normalizedTools = normalizedToolsResult.tools;
         const normalizedToolChoice = normalizeToolChoice(toolChoice);
         if (normalizedToolChoice.mode === 'invalid') {
             return res.status(400).json({
@@ -769,6 +947,27 @@ app.post('/v1/responses', async (req, res) => {
                     type: 'invalid_request_error'
                 }
             });
+        }
+
+        if (normalizedToolChoice.mode === 'required' && normalizedTools.length === 0) {
+            return res.status(400).json({
+                error: {
+                    message: 'tool_choice=required requires at least one function tool',
+                    type: 'invalid_request_error'
+                }
+            });
+        }
+
+        if (normalizedToolChoice.mode === 'required' && normalizedToolChoice.name) {
+            const hasNamedTool = normalizedTools.some((tool) => tool.name === normalizedToolChoice.name);
+            if (!hasNamedTool) {
+                return res.status(400).json({
+                    error: {
+                        message: `tool_choice requires unknown function: ${normalizedToolChoice.name}`,
+                        type: 'invalid_request_error'
+                    }
+                });
+            }
         }
 
         const functionCallOutputs = extractFunctionCallOutputs(input);
@@ -786,28 +985,15 @@ app.post('/v1/responses', async (req, res) => {
             }
         }
 
-        if (functionCallOutputs.length > 0) {
-            if (!previousState) {
-                return res.status(400).json({
-                    error: {
-                        message: 'function_call_output requires a valid previous_response_id',
-                        type: 'invalid_request_error'
-                    }
-                });
-            }
-
-            const pendingById = new Map((previousState.pendingToolCalls || []).map((call) => [call.id, call]));
-            for (const outputItem of functionCallOutputs) {
-                if (!pendingById.has(outputItem.call_id)) {
-                    return res.status(400).json({
-                        error: {
-                            message: `Unknown function_call_output call_id: ${outputItem.call_id}`,
-                            type: 'invalid_request_error'
-                        }
-                    });
-                }
-            }
+        const continuationValidation = validateFunctionCallOutputs(
+            functionCallOutputs,
+            previousResponseId,
+            previousState
+        );
+        if (continuationValidation.error) {
+            return res.status(400).json({ error: continuationValidation.error });
         }
+        const validatedFunctionCallOutputs = continuationValidation.validOutputs;
 
         const selectedModel = model || previousState?.model || 'opencode/big-pickle';
         const { providerId, modelId } = parseModel(selectedModel);
@@ -833,21 +1019,31 @@ app.post('/v1/responses', async (req, res) => {
         }
 
         let normalizedInput = input;
-        if (functionCallOutputs.length > 0) {
-            const pendingById = new Map((previousState?.pendingToolCalls || []).map((call) => [call.id, call]));
+        if (validatedFunctionCallOutputs.length > 0) {
             const passthroughItems = Array.isArray(input)
                 ? input.filter((item) => item?.type !== 'function_call_output')
                 : [];
 
-            const toolOutputMessages = functionCallOutputs.map((item) => {
-                const pendingCall = pendingById.get(item.call_id);
+            const toolOutputMessages = validatedFunctionCallOutputs.map(({ output, call }) => {
                 return {
                     role: 'user',
-                    content: `Tool output for ${pendingCall.name} (${item.call_id}): ${toToolResultString(item.output)}`
+                    content: `Tool output for ${call.name} (${output.call_id}): ${toToolResultString(output.output)}`
                 };
             });
 
             normalizedInput = [...passthroughItems, ...toolOutputMessages];
+
+            const updatedPendingToolCalls = (previousState.pendingToolCalls || []).map((call) => {
+                const resolved = validatedFunctionCallOutputs.some(({ output }) => output.call_id === call.call_id);
+                return resolved
+                    ? { ...call, status: 'completed' }
+                    : call;
+            });
+
+            storeResponseState(previousResponseId, {
+                ...previousState,
+                pendingToolCalls: updatedPendingToolCalls
+            });
         }
 
         const messages = normalizeResponsesInputToMessages({ input: normalizedInput, instructions });
@@ -869,8 +1065,8 @@ app.post('/v1/responses', async (req, res) => {
         const { allParts, fullPromptText, systemPrompt } = await buildPromptPartsAndSystem(messages);
 
         const createdAt = Math.floor(Date.now() / 1000);
-        const responseId = `resp_${Date.now()}`;
-        const outputMessageId = `msg_${Date.now()}`;
+        const responseId = createId('resp');
+        const outputMessageId = createId('msg');
         const enableTools = normalizedTools.length > 0 && normalizedToolChoice.mode !== 'none';
 
         if (stream) {
@@ -882,6 +1078,7 @@ app.post('/v1/responses', async (req, res) => {
             let reasoningText = '';
             let insideReasoning = false;
             let responseCompleted = false;
+            let assistantMessageStarted = false;
 
             sendResponseSseEvent(res, {
                 type: 'response.created',
@@ -894,18 +1091,26 @@ app.post('/v1/responses', async (req, res) => {
                 }
             });
 
-            sendResponseSseEvent(res, {
-                type: 'response.output_item.added',
-                response_id: responseId,
-                output_index: 0,
-                item: {
-                    id: outputMessageId,
-                    type: 'message',
-                    role: 'assistant',
-                    status: 'in_progress',
-                    content: [{ type: 'output_text', text: '' }]
+            const ensureAssistantMessageStarted = () => {
+                if (assistantMessageStarted) {
+                    return;
                 }
-            });
+
+                sendResponseSseEvent(res, {
+                    type: 'response.output_item.added',
+                    response_id: responseId,
+                    output_index: 0,
+                    item: {
+                        id: outputMessageId,
+                        type: 'message',
+                        role: 'assistant',
+                        status: 'in_progress',
+                        content: [{ type: 'output_text', text: '' }]
+                    }
+                });
+
+                assistantMessageStarted = true;
+            };
 
             try {
                 client.session.prompt({
@@ -944,6 +1149,7 @@ app.post('/v1/responses', async (req, res) => {
                         if (part.type === 'reasoning') {
                             if (!insideReasoning) {
                                 if (!enableTools) {
+                                    ensureAssistantMessageStarted();
                                     sendResponseSseEvent(res, {
                                         type: 'response.output_text.delta',
                                         response_id: responseId,
@@ -957,6 +1163,7 @@ app.post('/v1/responses', async (req, res) => {
                             }
 
                             if (!enableTools) {
+                                ensureAssistantMessageStarted();
                                 sendResponseSseEvent(res, {
                                     type: 'response.output_text.delta',
                                     response_id: responseId,
@@ -969,6 +1176,7 @@ app.post('/v1/responses', async (req, res) => {
                         } else if (part.type === 'text') {
                             if (insideReasoning) {
                                 if (!enableTools) {
+                                    ensureAssistantMessageStarted();
                                     sendResponseSseEvent(res, {
                                         type: 'response.output_text.delta',
                                         response_id: responseId,
@@ -982,6 +1190,7 @@ app.post('/v1/responses', async (req, res) => {
                             }
 
                             if (!enableTools) {
+                                ensureAssistantMessageStarted();
                                 sendResponseSseEvent(res, {
                                     type: 'response.output_text.delta',
                                     response_id: responseId,
@@ -999,6 +1208,7 @@ app.post('/v1/responses', async (req, res) => {
                         if (messageInfo?.sessionID === sessionId && messageInfo?.finish === 'stop') {
                             if (insideReasoning) {
                                 if (!enableTools) {
+                                    ensureAssistantMessageStarted();
                                     sendResponseSseEvent(res, {
                                         type: 'response.output_text.delta',
                                         response_id: responseId,
@@ -1011,13 +1221,43 @@ app.post('/v1/responses', async (req, res) => {
                             }
 
                             const usage = buildResponsesUsage(fullPromptText, completionText, reasoningText);
-                            const toolCalls = enableTools ? extractToolCallsFromText(completionText) : [];
+                            const extracted = enableTools
+                                ? extractToolCallsFromText(completionText)
+                                : { toolCalls: [], malformed: false };
+                            const toolCalls = extracted.toolCalls;
+
+                            if (enableTools && extracted.malformed) {
+                                sendResponseSseEvent(res, {
+                                    type: 'error',
+                                    error: {
+                                        message: 'Malformed tool call payload from model output',
+                                        type: 'invalid_response_error'
+                                    }
+                                });
+                                res.end();
+                                responseCompleted = true;
+                                break;
+                            }
 
                             if (enableTools && normalizedToolChoice.mode === 'required' && toolCalls.length === 0) {
                                 sendResponseSseEvent(res, {
                                     type: 'error',
                                     error: {
-                                        message: 'Model did not produce required function call output'
+                                        message: 'Model did not produce required function call output',
+                                        type: 'invalid_response_error'
+                                    }
+                                });
+                                res.end();
+                                responseCompleted = true;
+                                break;
+                            }
+
+                            if (toolCalls.length > 0 && parallelToolCalls !== true && toolCalls.length > 1) {
+                                sendResponseSseEvent(res, {
+                                    type: 'error',
+                                    error: {
+                                        message: 'Model returned multiple tool calls while parallel_tool_calls is false',
+                                        type: 'invalid_response_error'
                                     }
                                 });
                                 res.end();
@@ -1032,7 +1272,10 @@ app.post('/v1/responses', async (req, res) => {
                                     if (!toolDef) {
                                         sendResponseSseEvent(res, {
                                             type: 'error',
-                                            error: { message: `Model attempted unknown tool: ${toolCall.name}` }
+                                            error: {
+                                                message: `Model attempted unknown tool: ${toolCall.name}`,
+                                                type: 'invalid_response_error'
+                                            }
                                         });
                                         res.end();
                                         responseCompleted = true;
@@ -1045,19 +1288,35 @@ app.post('/v1/responses', async (req, res) => {
                                     break;
                                 }
 
-                                const outputItems = [];
-                                for (let idx = 0; idx < validatedCalls.length; idx += 1) {
-                                    const toolCall = validatedCalls[idx];
-                                    const itemId = `fc_${Date.now()}_${idx}`;
+                                if (normalizedToolChoice.mode === 'required' && normalizedToolChoice.name) {
+                                    const hasRequiredCall = validatedCalls.some((call) => call.name === normalizedToolChoice.name);
+                                    if (!hasRequiredCall) {
+                                        sendResponseSseEvent(res, {
+                                            type: 'error',
+                                            error: {
+                                                message: `Model did not call required function: ${normalizedToolChoice.name}`,
+                                                type: 'invalid_response_error'
+                                            }
+                                        });
+                                        res.end();
+                                        responseCompleted = true;
+                                        break;
+                                    }
+                                }
+
+                                const outputItems = buildFunctionCallOutputItems(validatedCalls);
+                                for (let idx = 0; idx < outputItems.length; idx += 1) {
+                                    const outputItem = outputItems[idx];
+
                                     sendResponseSseEvent(res, {
                                         type: 'response.output_item.added',
                                         response_id: responseId,
                                         output_index: idx,
                                         item: {
-                                            id: itemId,
+                                            id: outputItem.id,
                                             type: 'function_call',
-                                            call_id: toolCall.id,
-                                            name: toolCall.name,
+                                            call_id: outputItem.call_id,
+                                            name: outputItem.name,
                                             arguments: '',
                                             status: 'in_progress'
                                         }
@@ -1067,26 +1326,17 @@ app.post('/v1/responses', async (req, res) => {
                                         type: 'response.function_call_arguments.delta',
                                         response_id: responseId,
                                         output_index: idx,
-                                        item_id: itemId,
-                                        delta: toolCall.arguments
+                                        item_id: outputItem.id,
+                                        delta: outputItem.arguments
                                     });
 
                                     sendResponseSseEvent(res, {
                                         type: 'response.function_call_arguments.done',
                                         response_id: responseId,
                                         output_index: idx,
-                                        item_id: itemId,
-                                        arguments: toolCall.arguments
+                                        item_id: outputItem.id,
+                                        arguments: outputItem.arguments
                                     });
-
-                                    const outputItem = {
-                                        id: itemId,
-                                        type: 'function_call',
-                                        call_id: toolCall.id,
-                                        name: toolCall.name,
-                                        arguments: toolCall.arguments,
-                                        status: 'completed'
-                                    };
 
                                     sendResponseSseEvent(res, {
                                         type: 'response.output_item.done',
@@ -1094,8 +1344,6 @@ app.post('/v1/responses', async (req, res) => {
                                         output_index: idx,
                                         item: outputItem
                                     });
-
-                                    outputItems.push(outputItem);
                                 }
 
                                 sendResponseSseEvent(res, {
@@ -1115,7 +1363,13 @@ app.post('/v1/responses', async (req, res) => {
                                 storeResponseState(responseId, {
                                     sessionId,
                                     model: `${providerId}/${modelId}`,
-                                    pendingToolCalls: validatedCalls
+                                    pendingToolCalls: outputItems.map((item) => ({
+                                        call_id: item.call_id,
+                                        name: item.name,
+                                        arguments: item.arguments,
+                                        item_id: item.id,
+                                        status: 'pending'
+                                    }))
                                 });
 
                                 res.write('data: [DONE]\n\n');
@@ -1125,6 +1379,7 @@ app.post('/v1/responses', async (req, res) => {
                                 break;
                             }
 
+                            ensureAssistantMessageStarted();
                             sendResponseSseEvent(res, {
                                 type: 'response.output_item.done',
                                 response_id: responseId,
@@ -1216,11 +1471,33 @@ app.post('/v1/responses', async (req, res) => {
         const finalOutputText = buildResponsesOutputText(content, reasoningContent);
         const usage = buildResponsesUsage(fullPromptText, content, reasoningContent);
 
-        const toolCalls = enableTools ? extractToolCallsFromText(content) : [];
+        const extractedToolCalls = enableTools
+            ? extractToolCallsFromText(content)
+            : { toolCalls: [], malformed: false };
+        const toolCalls = extractedToolCalls.toolCalls;
+
+        if (enableTools && extractedToolCalls.malformed) {
+            return res.status(500).json({
+                error: {
+                    message: 'Malformed tool call payload from model output',
+                    type: 'invalid_response_error'
+                }
+            });
+        }
+
         if (enableTools && normalizedToolChoice.mode === 'required' && toolCalls.length === 0) {
             return res.status(500).json({
                 error: {
                     message: 'Model did not produce required function call output',
+                    type: 'invalid_response_error'
+                }
+            });
+        }
+
+        if (toolCalls.length > 0 && parallelToolCalls !== true && toolCalls.length > 1) {
+            return res.status(500).json({
+                error: {
+                    message: 'Model returned multiple tool calls while parallel_tool_calls is false',
                     type: 'invalid_response_error'
                 }
             });
@@ -1239,19 +1516,30 @@ app.post('/v1/responses', async (req, res) => {
                 }
             }
 
-            const output = toolCalls.map((toolCall, index) => ({
-                id: `fc_${Date.now()}_${index}`,
-                type: 'function_call',
-                call_id: toolCall.id,
-                name: toolCall.name,
-                arguments: toolCall.arguments,
-                status: 'completed'
-            }));
+            if (normalizedToolChoice.mode === 'required' && normalizedToolChoice.name) {
+                const hasRequiredCall = toolCalls.some((call) => call.name === normalizedToolChoice.name);
+                if (!hasRequiredCall) {
+                    return res.status(500).json({
+                        error: {
+                            message: `Model did not call required function: ${normalizedToolChoice.name}`,
+                            type: 'invalid_response_error'
+                        }
+                    });
+                }
+            }
+
+            const output = buildFunctionCallOutputItems(toolCalls);
 
             storeResponseState(responseId, {
                 sessionId,
                 model: `${providerId}/${modelId}`,
-                pendingToolCalls: toolCalls
+                pendingToolCalls: output.map((item) => ({
+                    call_id: item.call_id,
+                    name: item.name,
+                    arguments: item.arguments,
+                    item_id: item.id,
+                    status: 'pending'
+                }))
             });
 
             return res.json({

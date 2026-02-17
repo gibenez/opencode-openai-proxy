@@ -130,6 +130,12 @@ curl http://localhost:4096/v1/responses \
 
 `/v1/responses` also supports function/tool calling with `tools`, `tool_choice`, and `function_call_output` continuation using `previous_response_id`.
 
+LangChain compatibility notes:
+- Function-call lifecycle is deterministic for stream and non-stream responses (`id` + `call_id` are stable per call).
+- `function_call_output` validation is strict (`previous_response_id` required, unknown `call_id` rejected, duplicate submissions rejected).
+- Built-in Responses tool types (`web_search`, `file_search`, `code_interpreter`) are explicitly rejected with `invalid_request_error`.
+- Current limitation: tool call detection still relies on constrained JSON extraction from model text output; malformed payloads fail explicitly with `invalid_response_error`.
+
 ---
 
 ## 🧪 Automated Tests
