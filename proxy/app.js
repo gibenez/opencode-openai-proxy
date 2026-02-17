@@ -1519,6 +1519,13 @@ app.post('/v1/responses', async (req, res) => {
         const responseId = createId('resp');
         const outputMessageId = createId('msg');
         const enableTools = normalizedTools.length > 0 && normalizedToolChoice.mode !== 'none';
+        const structuredParserMode = enableTools && hasStructuredOutputFormatterTool(normalizedTools);
+
+        debugLog('responses.tools.mode', {
+            requestId,
+            enableTools,
+            structuredParserMode
+        });
 
         if (stream) {
             res.setHeader('Content-Type', 'text/event-stream');
@@ -1682,6 +1689,15 @@ app.post('/v1/responses', async (req, res) => {
                                 ? extractToolCallsFromText(completionText)
                                 : { toolCalls: [], malformed: false };
                             const toolCalls = extracted.toolCalls;
+                            const finalizerCalled = toolCalls.some((call) => call.name === 'format_final_json_response');
+
+                            debugLog('responses.stream.tool_extraction', {
+                                requestId,
+                                extractedCount: toolCalls.length,
+                                malformed: extracted.malformed,
+                                structuredParserMode,
+                                finalizerCalled
+                            });
 
                             if (enableTools && extracted.malformed) {
                                 sendResponseSseEvent(res, {
@@ -1701,6 +1717,19 @@ app.post('/v1/responses', async (req, res) => {
                                     type: 'error',
                                     error: {
                                         message: 'Model did not produce required function call output',
+                                        type: 'invalid_response_error'
+                                    }
+                                });
+                                res.end();
+                                responseCompleted = true;
+                                break;
+                            }
+
+                            if (structuredParserMode && toolCalls.length === 0) {
+                                sendResponseSseEvent(res, {
+                                    type: 'error',
+                                    error: {
+                                        message: 'Structured parser mode requires at least one function call output',
                                         type: 'invalid_response_error'
                                     }
                                 });
@@ -1995,6 +2024,15 @@ app.post('/v1/responses', async (req, res) => {
             ? extractToolCallsFromText(content)
             : { toolCalls: [], malformed: false };
         const toolCalls = extractedToolCalls.toolCalls;
+        const finalizerCalled = toolCalls.some((call) => call.name === 'format_final_json_response');
+
+        debugLog('responses.non_stream.tool_extraction', {
+            requestId,
+            extractedCount: toolCalls.length,
+            malformed: extractedToolCalls.malformed,
+            structuredParserMode,
+            finalizerCalled
+        });
 
         if (enableTools && extractedToolCalls.malformed) {
             return res.status(500).json({
@@ -2009,6 +2047,15 @@ app.post('/v1/responses', async (req, res) => {
             return res.status(500).json({
                 error: {
                     message: 'Model did not produce required function call output',
+                    type: 'invalid_response_error'
+                }
+            });
+        }
+
+        if (structuredParserMode && toolCalls.length === 0) {
+            return res.status(500).json({
+                error: {
+                    message: 'Structured parser mode requires at least one function call output',
                     type: 'invalid_response_error'
                 }
             });

@@ -75,6 +75,17 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
                     };
                 }
 
+                if (promptText.includes('Use formatter tool')) {
+                    return {
+                        data: {
+                            parts: [{
+                                type: 'text',
+                                text: '{"tool_calls":[{"name":"format_final_json_response","arguments":{"facts":["Cats sleep 12-16 hours"]}}]}'
+                            }]
+                        }
+                    };
+                }
+
                 if (promptText.includes('Tool output for weather')) {
                     return {
                         data: {
@@ -97,26 +108,32 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
         event: {
             subscribe: jest.fn(async () => {
                 const sessionId = 'test-session-id';
-                const shouldEmitToolCalls = (lastPromptText.includes('Use weather tool') || lastPromptText.includes('Use weather and time tool'))
-                    && !lastPromptText.includes('Tool output for weather');
-
-                const mockEvents = shouldEmitToolCalls
-                    ? [
-                        { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: sessionId }, delta: '{"tool_calls":[' } },
-                        { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: sessionId }, delta: lastPromptText.includes('Use weather and time tool')
-                            ? '{"name":"weather","arguments":{"city":"Rome"}},{"name":"time","arguments":{"city":"Rome"}}]}'
-                            : '{"name":"weather","arguments":{"city":"Rome"}}]}' } },
-                        { type: 'message.updated', properties: { info: { sessionID: sessionId, finish: 'stop' } } }
-                    ]
-                    : [
-                        { type: 'message.part.updated', properties: { part: { type: 'reasoning', sessionID: sessionId }, delta: 'Thinking...' } },
-                        { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: sessionId }, delta: 'Resposta' } },
-                        { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: sessionId }, delta: ' simulada' } },
-                        { type: 'message.updated', properties: { info: { sessionID: sessionId, finish: 'stop' } } }
-                    ];
-
                 return {
                     stream: (async function* () {
+                        const shouldEmitToolCalls = (lastPromptText.includes('Use weather tool') || lastPromptText.includes('Use weather and time tool'))
+                            && !lastPromptText.includes('Tool output for weather');
+                        const shouldEmitFormatterCall = lastPromptText.includes('Use formatter tool');
+
+                        const mockEvents = shouldEmitToolCalls
+                            ? [
+                                { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: sessionId }, delta: '{"tool_calls":[' } },
+                                { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: sessionId }, delta: lastPromptText.includes('Use weather and time tool')
+                                    ? '{"name":"weather","arguments":{"city":"Rome"}},{"name":"time","arguments":{"city":"Rome"}}]}'
+                                    : '{"name":"weather","arguments":{"city":"Rome"}}]}' } },
+                                { type: 'message.updated', properties: { info: { sessionID: sessionId, finish: 'stop' } } }
+                            ]
+                            : shouldEmitFormatterCall
+                                ? [
+                                    { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: sessionId }, delta: '{"tool_calls":[{"name":"format_final_json_response","arguments":{"facts":["Cats sleep 12-16 hours"]}}]}' } },
+                                    { type: 'message.updated', properties: { info: { sessionID: sessionId, finish: 'stop' } } }
+                                ]
+                            : [
+                                { type: 'message.part.updated', properties: { part: { type: 'reasoning', sessionID: sessionId }, delta: 'Thinking...' } },
+                                { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: sessionId }, delta: 'Resposta' } },
+                                { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: sessionId }, delta: ' simulada' } },
+                                { type: 'message.updated', properties: { info: { sessionID: sessionId, finish: 'stop' } } }
+                            ];
+
                         for (const event of mockEvents) {
                             yield event;
                         }
@@ -402,6 +419,41 @@ describe('Proxy OpenAI API', () => {
         expect(res.body.object).toEqual('response');
         expect(res.body.output[0].type).toEqual('function_call');
         expect(res.body.output[0].name).toEqual('weather');
+    });
+
+    test('POST /v1/responses deve falhar quando structured parser mode não gera function call', async () => {
+        const res = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                model: 'opencode/gpt-5-nano',
+                input: 'Pergunta simples sem uso de ferramenta',
+                tools: [
+                    { type: 'function', function: { name: 'weather', parameters: { type: 'object' } } },
+                    { type: 'function', function: { name: 'format_final_json_response', parameters: { type: 'object' } } }
+                ]
+            });
+
+        expect(res.statusCode).toEqual(500);
+        expect(res.body.error.type).toEqual('invalid_response_error');
+        expect(res.body.error.message).toContain('Structured parser mode requires at least one function call output');
+    });
+
+    test('POST /v1/responses deve aceitar structured parser mode quando houver function call', async () => {
+        const res = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                model: 'opencode/gpt-5-nano',
+                input: 'Use formatter tool',
+                tools: [
+                    { type: 'function', function: { name: 'format_final_json_response', parameters: { type: 'object' } } }
+                ]
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.body.output[0].type).toEqual('function_call');
+        expect(res.body.output[0].name).toEqual('format_final_json_response');
     });
 
     test('POST /v1/responses deve falhar explicitamente quando tool_choice=required não gera tool call', async () => {
