@@ -38,6 +38,20 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
             prompt: jest.fn(async (args) => {
                 const promptText = args.body.prompt || '';
                 lastPromptText = promptText;
+                const systemText = args.body.system || '';
+
+                if (promptText.includes('Inspect langchain policy bypass')) {
+                    return {
+                        data: {
+                            parts: [{
+                                type: 'text',
+                                text: systemText.includes('TOOLS AVAILABLE:')
+                                    ? 'proxy-policy-applied'
+                                    : 'proxy-policy-bypassed'
+                            }]
+                        }
+                    };
+                }
 
                 if (promptText.includes('Use weather tool') && !promptText.includes('Tool output for weather')) {
                     return {
@@ -335,6 +349,38 @@ describe('Proxy OpenAI API', () => {
         expect(res.body.output[0].call_id).toMatch(/^call_/);
         expect(res.body.output[0].name).toEqual('weather');
         expect(res.body.output[0].arguments).toContain('Rome');
+    });
+
+    test('POST /v1/responses deve ignorar instrução de tools para user-agent do LangChain', async () => {
+        const res = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-password')
+            .set('User-Agent', 'langchainjs-openai/1.0.0')
+            .send({
+                model: 'opencode/gpt-5-nano',
+                input: 'Inspect langchain policy bypass',
+                tools: [{ type: 'function', function: { name: 'weather', parameters: { type: 'object' } } }]
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.body.output[0].type).toEqual('message');
+        expect(res.body.output[0].content[0].text).toEqual('proxy-policy-bypassed');
+    });
+
+    test('POST /v1/responses deve manter instrução de tools para user-agent não LangChain', async () => {
+        const res = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-password')
+            .set('User-Agent', 'custom-client/1.0')
+            .send({
+                model: 'opencode/gpt-5-nano',
+                input: 'Inspect langchain policy bypass',
+                tools: [{ type: 'function', function: { name: 'weather', parameters: { type: 'object' } } }]
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.body.output[0].type).toEqual('message');
+        expect(res.body.output[0].content[0].text).toEqual('proxy-policy-applied');
     });
 
     test('POST /v1/responses deve aceitar tool function no formato top-level compatível com LangChain', async () => {

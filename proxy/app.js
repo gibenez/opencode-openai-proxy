@@ -441,6 +441,14 @@ function hasStructuredOutputFormatterTool(tools) {
     return tools.some((tool) => tool.name === 'format_final_json_response');
 }
 
+function isLangChainUserAgent(userAgent) {
+    if (typeof userAgent !== 'string') {
+        return false;
+    }
+
+    return userAgent.toLowerCase().startsWith('langchainjs-openai/');
+}
+
 function buildToolSystemInstruction(tools, toolChoice, parallelToolCalls) {
     if (!tools.length) {
         return '';
@@ -1257,6 +1265,8 @@ app.post('/v1/responses', async (req, res) => {
             parallel_tool_calls: parallelToolCalls,
             text
         } = req.body || {};
+        const userAgent = req.headers['user-agent'];
+        const isLangChainUa = isLangChainUserAgent(userAgent);
 
         debugLog('responses.request.received', {
             requestId,
@@ -1271,7 +1281,9 @@ app.post('/v1/responses', async (req, res) => {
             textSummary: {
                 kind: typeof text,
                 keys: text && typeof text === 'object' ? Object.keys(text) : []
-            }
+            },
+            userAgent,
+            isLangChainUa
         });
 
         const normalizedToolsResult = normalizeTools(tools);
@@ -1448,16 +1460,24 @@ app.post('/v1/responses', async (req, res) => {
         const messages = normalizeResponsesInputToMessages({ input: normalizedInput, instructions });
 
         if (normalizedTools.length > 0) {
-            const toolInstruction = buildToolSystemInstruction(normalizedTools, normalizedToolChoice, parallelToolCalls === true);
-            messages.unshift({ role: 'system', content: toolInstruction });
+            if (isLangChainUa) {
+                debugLog('responses.tools.instruction_built', {
+                    requestId,
+                    mode: 'bypass_langchain_ua',
+                    instructionChars: 0
+                });
+            } else {
+                const toolInstruction = buildToolSystemInstruction(normalizedTools, normalizedToolChoice, parallelToolCalls === true);
+                messages.unshift({ role: 'system', content: toolInstruction });
 
-            debugLog('responses.tools.instruction_built', {
-                requestId,
-                mode: hasStructuredOutputFormatterTool(normalizedTools)
-                    ? 'langchain_structured_policy'
-                    : 'default_tools_policy',
-                instructionChars: toolInstruction.length
-            });
+                debugLog('responses.tools.instruction_built', {
+                    requestId,
+                    mode: hasStructuredOutputFormatterTool(normalizedTools)
+                        ? 'langchain_structured_policy'
+                        : 'default_tools_policy',
+                    instructionChars: toolInstruction.length
+                });
+            }
         }
 
         if (messages.length === 0) {
