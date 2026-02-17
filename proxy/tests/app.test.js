@@ -337,6 +337,27 @@ describe('Proxy OpenAI API', () => {
         expect(res.body.output[0].arguments).toContain('Rome');
     });
 
+    test('POST /v1/responses deve aceitar tool function no formato top-level compatível com LangChain', async () => {
+        const res = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                model: 'opencode/gpt-5-nano',
+                input: 'Use weather tool',
+                tools: [{
+                    type: 'function',
+                    name: 'weather',
+                    description: 'Get weather by city',
+                    parameters: { type: 'object', properties: {} }
+                }]
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.body.object).toEqual('response');
+        expect(res.body.output[0].type).toEqual('function_call');
+        expect(res.body.output[0].name).toEqual('weather');
+    });
+
     test('POST /v1/responses deve falhar explicitamente quando tool_choice=required não gera tool call', async () => {
         const res = await request(app)
             .post('/v1/responses')

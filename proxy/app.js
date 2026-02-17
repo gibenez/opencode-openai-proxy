@@ -287,17 +287,22 @@ function normalizeTools(tools) {
         }
 
         if (tool.type === 'function') {
-            if (!tool.function?.name) {
+            const functionDef = tool.function && typeof tool.function === 'object'
+                ? tool.function
+                : tool;
+            const functionName = typeof functionDef.name === 'string' ? functionDef.name.trim() : '';
+
+            if (!functionName) {
                 return {
                     tools: [],
-                    error: 'Function tools must include function.name'
+                    error: 'Function tools must include a name'
                 };
             }
 
             normalized.push({
-                name: tool.function.name,
-                description: tool.function.description || '',
-                parameters: tool.function.parameters || { type: 'object', properties: {} }
+                name: functionName,
+                description: functionDef.description || '',
+                parameters: functionDef.parameters || functionDef.input_schema || { type: 'object', properties: {} }
             });
             continue;
         }
