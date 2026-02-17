@@ -9,6 +9,120 @@ const app = express();
 const TARGET_PORT = 4097;
 const RESPONSE_STATE_TTL_MS = 30 * 60 * 1000;
 const responseState = new Map();
+const LOG_LEVEL = (process.env.LOG_LEVEL || 'info').toLowerCase();
+
+function isDebugLoggingEnabled() {
+    return LOG_LEVEL === 'debug';
+}
+
+function debugLog(event, data = {}) {
+    if (!isDebugLoggingEnabled()) {
+        return;
+    }
+
+    try {
+        console.log(`[DEBUG] ${event}`, JSON.stringify(data));
+    } catch (error) {
+        console.log(`[DEBUG] ${event}`, data);
+    }
+}
+
+function safeJsonLength(value) {
+    try {
+        return JSON.stringify(value).length;
+    } catch (error) {
+        return -1;
+    }
+}
+
+function estimateSchemaDepth(value, depth = 0) {
+    if (!value || typeof value !== 'object') {
+        return depth;
+    }
+
+    let maxDepth = depth;
+    for (const nested of Object.values(value)) {
+        const nestedDepth = estimateSchemaDepth(nested, depth + 1);
+        if (nestedDepth > maxDepth) {
+            maxDepth = nestedDepth;
+        }
+    }
+
+    return maxDepth;
+}
+
+function summarizeTools(tools) {
+    if (!Array.isArray(tools)) {
+        return {
+            provided: tools !== undefined,
+            isArray: false,
+            count: 0
+        };
+    }
+
+    return {
+        provided: true,
+        isArray: true,
+        count: tools.length,
+        items: tools.map((tool, index) => {
+            const functionDef = tool?.function && typeof tool.function === 'object' ? tool.function : tool;
+            const schema = functionDef?.parameters || functionDef?.input_schema;
+            return {
+                index,
+                type: tool?.type,
+                name: functionDef?.name || null,
+                hasDescription: Boolean(functionDef?.description),
+                schemaBytes: safeJsonLength(schema),
+                schemaDepth: estimateSchemaDepth(schema)
+            };
+        })
+    };
+}
+
+function summarizeResponsesInput(input) {
+    if (typeof input === 'string') {
+        return { kind: 'string', length: input.length };
+    }
+
+    if (!Array.isArray(input)) {
+        return { kind: typeof input };
+    }
+
+    const typeCounts = {};
+    const roleCounts = {};
+    for (const item of input) {
+        const itemType = typeof item === 'string'
+            ? 'string'
+            : item?.type || (item?.role ? 'role_item' : typeof item);
+        typeCounts[itemType] = (typeCounts[itemType] || 0) + 1;
+
+        if (item?.role) {
+            roleCounts[item.role] = (roleCounts[item.role] || 0) + 1;
+        }
+    }
+
+    return {
+        kind: 'array',
+        count: input.length,
+        typeCounts,
+        roleCounts
+    };
+}
+
+function getErrorDetails(error) {
+    return {
+        name: error?.name,
+        message: error?.message,
+        code: error?.code,
+        cause: error?.cause
+            ? {
+                name: error.cause.name,
+                message: error.cause.message,
+                code: error.cause.code
+            }
+            : null
+    };
+}
 
 app.use(cors());
 app.use(bodyParser.json({ limit: '50mb' }));
@@ -1010,6 +1124,8 @@ app.post('/v1/chat/completions', async (req, res) => {
 });
 
 app.post('/v1/responses', async (req, res) => {
+    const requestId = createId('req');
+    const requestStartedAt = Date.now();
     try {
         const {
             input,
@@ -1019,11 +1135,32 @@ app.post('/v1/responses', async (req, res) => {
             previous_response_id: previousResponseId,
             tools,
             tool_choice: toolChoice,
-            parallel_tool_calls: parallelToolCalls
+            parallel_tool_calls: parallelToolCalls,
+            text
         } = req.body || {};
+
+        debugLog('responses.request.received', {
+            requestId,
+            stream: stream === true,
+            model,
+            hasPreviousResponseId: Boolean(previousResponseId),
+            previousResponseId,
+            toolChoiceType: typeof toolChoice,
+            parallelToolCalls,
+            inputSummary: summarizeResponsesInput(input),
+            toolsSummary: summarizeTools(tools),
+            textSummary: {
+                kind: typeof text,
+                keys: text && typeof text === 'object' ? Object.keys(text) : []
+            }
+        });
 
         const normalizedToolsResult = normalizeTools(tools);
         if (normalizedToolsResult.error) {
+            debugLog('responses.tools.invalid', {
+                requestId,
+                error: normalizedToolsResult.error
+            });
             return res.status(400).json({
                 error: {
                     message: normalizedToolsResult.error,
@@ -1033,8 +1170,17 @@ app.post('/v1/responses', async (req, res) => {
         }
 
         const normalizedTools = normalizedToolsResult.tools;
+        debugLog('responses.tools.normalized', {
+            requestId,
+            count: normalizedTools.length,
+            names: normalizedTools.map((tool) => tool.name)
+        });
         const normalizedToolChoice = normalizeToolChoice(toolChoice);
         if (normalizedToolChoice.mode === 'invalid') {
+            debugLog('responses.tool_choice.invalid', {
+                requestId,
+                reason: normalizedToolChoice.reason
+            });
             return res.status(400).json({
                 error: {
                     message: normalizedToolChoice.reason,
@@ -1085,6 +1231,10 @@ app.post('/v1/responses', async (req, res) => {
             previousState
         );
         if (resolvedTargets.error) {
+            debugLog('responses.function_call_output.resolve_failed', {
+                requestId,
+                error: resolvedTargets.error.message
+            });
             return res.status(400).json({ error: resolvedTargets.error });
         }
 
@@ -1093,9 +1243,20 @@ app.post('/v1/responses', async (req, res) => {
 
         const continuationValidation = validateFunctionCallOutputs(functionCallOutputs, ownershipByCallId);
         if (continuationValidation.error) {
+            debugLog('responses.function_call_output.invalid', {
+                requestId,
+                error: continuationValidation.error.message
+            });
             return res.status(400).json({ error: continuationValidation.error });
         }
         const actionableFunctionCallOutputs = continuationValidation.actionableOutputs;
+
+        debugLog('responses.function_call_output.summary', {
+            requestId,
+            received: functionCallOutputs.length,
+            actionable: continuationValidation.actionableOutputs.length,
+            alreadyCompleted: continuationValidation.alreadyCompletedOutputs.length
+        });
 
         const selectedModel = model || previousState?.model || 'opencode/big-pickle';
         const { providerId, modelId } = parseModel(selectedModel);
@@ -1213,6 +1374,18 @@ app.post('/v1/responses', async (req, res) => {
 
         const { allParts, fullPromptText, systemPrompt } = await buildPromptPartsAndSystem(messages);
 
+        debugLog('responses.prompt.built', {
+            requestId,
+            elapsedMs: Date.now() - requestStartedAt,
+            messageCount: messages.length,
+            partsCount: allParts.length,
+            promptChars: fullPromptText.length,
+            systemChars: systemPrompt.length,
+            model: `${providerId}/${modelId}`,
+            sessionId,
+            stream: stream === true
+        });
+
         const createdAt = Math.floor(Date.now() / 1000);
         const responseId = createId('resp');
         const outputMessageId = createId('msg');
@@ -1262,6 +1435,12 @@ app.post('/v1/responses', async (req, res) => {
             };
 
             try {
+                debugLog('responses.stream.prompt.start', {
+                    requestId,
+                    elapsedMs: Date.now() - requestStartedAt,
+                    sessionId,
+                    model: `${providerId}/${modelId}`
+                });
                 client.session.prompt({
                     path: { id: sessionId },
                     body: {
@@ -1509,6 +1688,12 @@ app.post('/v1/responses', async (req, res) => {
                                     }
                                 });
 
+                                debugLog('responses.stream.completed.tools', {
+                                    requestId,
+                                    elapsedMs: Date.now() - requestStartedAt,
+                                    outputCount: outputItems.length
+                                });
+
                                 storeResponseState(responseId, {
                                     sessionId,
                                     model: `${providerId}/${modelId}`,
@@ -1562,6 +1747,12 @@ app.post('/v1/responses', async (req, res) => {
                                 }
                             });
 
+                            debugLog('responses.stream.completed.message', {
+                                requestId,
+                                elapsedMs: Date.now() - requestStartedAt,
+                                textChars: `${reasoningText}${completionText}`.length
+                            });
+
                             storeResponseState(responseId, {
                                 sessionId,
                                 model: `${providerId}/${modelId}`,
@@ -1580,6 +1771,11 @@ app.post('/v1/responses', async (req, res) => {
                 clearInterval(keepaliveInterval);
             } catch (streamError) {
                 console.error('Responses streaming error:', streamError);
+                debugLog('responses.stream.error', {
+                    requestId,
+                    elapsedMs: Date.now() - requestStartedAt,
+                    error: getErrorDetails(streamError)
+                });
                 if (!res.destroyed) {
                     sendResponseSseEvent(res, {
                         type: 'error',
@@ -1594,6 +1790,16 @@ app.post('/v1/responses', async (req, res) => {
             return;
         }
 
+        debugLog('responses.non_stream.prompt.start', {
+            requestId,
+            elapsedMs: Date.now() - requestStartedAt,
+            sessionId,
+            model: `${providerId}/${modelId}`,
+            promptChars: fullPromptText.length,
+            systemChars: systemPrompt.length,
+            partsCount: allParts.length
+        });
+
         const responseRes = await client.session.prompt({
             path: { id: sessionId },
             body: {
@@ -1605,6 +1811,13 @@ app.post('/v1/responses', async (req, res) => {
                 system: systemPrompt,
                 parts: allParts
             }
+        });
+
+        debugLog('responses.non_stream.prompt.returned', {
+            requestId,
+            elapsedMs: Date.now() - requestStartedAt,
+            partsCount: Array.isArray(responseRes.data?.parts) ? responseRes.data.parts.length : 0,
+            dataType: typeof responseRes.data
         });
 
         const parts = responseRes.data?.parts || [];
@@ -1730,6 +1943,11 @@ app.post('/v1/responses', async (req, res) => {
         });
     } catch (error) {
         console.error('Responses API Proxy Error:', error);
+        debugLog('responses.request.error', {
+            requestId,
+            elapsedMs: Date.now() - requestStartedAt,
+            error: getErrorDetails(error)
+        });
         const errorMessage = error.response?.data?.error?.message || error.message || 'Unknown error';
         return res.status(500).json({
             error: {
