@@ -101,8 +101,34 @@ curl -N http://localhost:4096/v1/responses \
   }'
 ```
 
-Note: in this phase, `/v1/responses` supports text/multimodal + streaming + `previous_response_id`.
-Function/tool calling is implemented in a separate feature branch.
+### Responses API Tool Calling Example
+```bash
+curl http://localhost:4096/v1/responses \
+  -H "Authorization: Bearer <YOUR_PASSWORD>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "opencode/gpt-5-nano",
+    "input": "Use weather tool for Rome",
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "weather",
+          "description": "Get weather by city",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": { "type": "string" }
+            },
+            "required": ["city"]
+          }
+        }
+      }
+    ]
+  }'
+```
+
+`/v1/responses` also supports function/tool calling with `tools`, `tool_choice`, and `function_call_output` continuation using `previous_response_id`.
 
 ---
 

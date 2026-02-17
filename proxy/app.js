@@ -244,6 +244,135 @@ function sendResponseSseEvent(res, payload) {
     res.write(`data: ${JSON.stringify(payload)}\n\n`);
 }
 
+function normalizeToolChoice(toolChoice) {
+    if (toolChoice === undefined || toolChoice === null) {
+        return { mode: 'auto' };
+    }
+
+    if (typeof toolChoice === 'string') {
+        if (toolChoice === 'auto' || toolChoice === 'none' || toolChoice === 'required') {
+            return { mode: toolChoice };
+        }
+        return { mode: 'invalid', reason: 'Invalid tool_choice string value' };
+    }
+
+    if (toolChoice.type === 'function' && toolChoice.function?.name) {
+        return { mode: 'required', name: toolChoice.function.name };
+    }
+
+    return { mode: 'invalid', reason: 'Invalid tool_choice object value' };
+}
+
+function normalizeTools(tools) {
+    if (!Array.isArray(tools)) {
+        return [];
+    }
+
+    return tools
+        .filter((tool) => tool?.type === 'function' && tool.function?.name)
+        .map((tool) => ({
+            name: tool.function.name,
+            description: tool.function.description || '',
+            parameters: tool.function.parameters || { type: 'object', properties: {} }
+        }));
+}
+
+function buildToolSystemInstruction(tools, toolChoice, parallelToolCalls) {
+    if (!tools.length) {
+        return '';
+    }
+
+    const toolList = tools.map((tool) => {
+        return `- ${tool.name}: ${tool.description || 'No description'}; parameters schema: ${JSON.stringify(tool.parameters)}`;
+    }).join('\n');
+
+    let policy = 'Use tools only when needed.';
+    if (toolChoice.mode === 'none') {
+        policy = 'Do not call tools. Respond normally.';
+    } else if (toolChoice.mode === 'required' && toolChoice.name) {
+        policy = `You must call tool \"${toolChoice.name}\".`;
+    } else if (toolChoice.mode === 'required') {
+        policy = 'You must call at least one tool.';
+    }
+
+    const parallelPolicy = parallelToolCalls ? 'Parallel calls are allowed.' : 'Return at most one tool call.';
+
+    return [
+        'TOOLS AVAILABLE:',
+        toolList,
+        policy,
+        parallelPolicy,
+        'If you decide to call a tool, respond with ONLY valid JSON in exactly this shape:',
+        '{"tool_calls":[{"name":"tool_name","arguments":{}}]}',
+        'If no tool call is needed, respond with normal assistant text.'
+    ].join('\n');
+}
+
+function extractToolCallsFromText(text) {
+    if (!text || typeof text !== 'string') {
+        return [];
+    }
+
+    const candidates = [text.trim()];
+    const fenced = text.match(/```json\s*([\s\S]*?)\s*```/i);
+    if (fenced && fenced[1]) {
+        candidates.push(fenced[1].trim());
+    }
+
+    for (const candidate of candidates) {
+        try {
+            const parsed = JSON.parse(candidate);
+            const rawCalls = Array.isArray(parsed?.tool_calls)
+                ? parsed.tool_calls
+                : parsed?.tool_call
+                    ? [parsed.tool_call]
+                    : [];
+
+            const normalized = rawCalls
+                .filter((call) => call?.name)
+                .map((call, index) => {
+                    const argsObj = typeof call.arguments === 'string'
+                        ? JSON.parse(call.arguments)
+                        : (call.arguments || {});
+
+                    return {
+                        id: call.call_id || `call_${Date.now()}_${index}`,
+                        name: call.name,
+                        arguments: JSON.stringify(argsObj)
+                    };
+                });
+
+            if (normalized.length) {
+                return normalized;
+            }
+        } catch (error) {
+            continue;
+        }
+    }
+
+    return [];
+}
+
+function extractFunctionCallOutputs(input) {
+    if (!Array.isArray(input)) {
+        return [];
+    }
+
+    return input.filter((item) => item?.type === 'function_call_output' && item.call_id);
+}
+
+function toToolResultString(output) {
+    if (typeof output === 'string') {
+        return output;
+    }
+
+    try {
+        return JSON.stringify(output);
+    } catch (error) {
+        return String(output);
+    }
+}
+
 // Auth Middleware
 app.use((req, res, next) => {
     // Permite health check sem auth
@@ -631,26 +760,18 @@ app.post('/v1/responses', async (req, res) => {
             parallel_tool_calls: parallelToolCalls
         } = req.body || {};
 
-        if (tools || toolChoice !== undefined || parallelToolCalls !== undefined) {
+        const normalizedTools = normalizeTools(tools);
+        const normalizedToolChoice = normalizeToolChoice(toolChoice);
+        if (normalizedToolChoice.mode === 'invalid') {
             return res.status(400).json({
                 error: {
-                    message: 'tools/function calling for /v1/responses is not enabled in this branch yet',
+                    message: normalizedToolChoice.reason,
                     type: 'invalid_request_error'
                 }
             });
         }
 
-        if (Array.isArray(input)) {
-            const hasToolOutputs = input.some((item) => item?.type === 'function_call_output');
-            if (hasToolOutputs) {
-                return res.status(400).json({
-                    error: {
-                        message: 'function_call_output is not enabled in this branch yet',
-                        type: 'invalid_request_error'
-                    }
-                });
-            }
-        }
+        const functionCallOutputs = extractFunctionCallOutputs(input);
 
         let previousState = null;
         if (previousResponseId) {
@@ -662,6 +783,29 @@ app.post('/v1/responses', async (req, res) => {
                         type: 'invalid_request_error'
                     }
                 });
+            }
+        }
+
+        if (functionCallOutputs.length > 0) {
+            if (!previousState) {
+                return res.status(400).json({
+                    error: {
+                        message: 'function_call_output requires a valid previous_response_id',
+                        type: 'invalid_request_error'
+                    }
+                });
+            }
+
+            const pendingById = new Map((previousState.pendingToolCalls || []).map((call) => [call.id, call]));
+            for (const outputItem of functionCallOutputs) {
+                if (!pendingById.has(outputItem.call_id)) {
+                    return res.status(400).json({
+                        error: {
+                            message: `Unknown function_call_output call_id: ${outputItem.call_id}`,
+                            type: 'invalid_request_error'
+                        }
+                    });
+                }
             }
         }
 
@@ -688,7 +832,31 @@ app.post('/v1/responses', async (req, res) => {
             }
         }
 
-        const messages = normalizeResponsesInputToMessages({ input, instructions });
+        let normalizedInput = input;
+        if (functionCallOutputs.length > 0) {
+            const pendingById = new Map((previousState?.pendingToolCalls || []).map((call) => [call.id, call]));
+            const passthroughItems = Array.isArray(input)
+                ? input.filter((item) => item?.type !== 'function_call_output')
+                : [];
+
+            const toolOutputMessages = functionCallOutputs.map((item) => {
+                const pendingCall = pendingById.get(item.call_id);
+                return {
+                    role: 'user',
+                    content: `Tool output for ${pendingCall.name} (${item.call_id}): ${toToolResultString(item.output)}`
+                };
+            });
+
+            normalizedInput = [...passthroughItems, ...toolOutputMessages];
+        }
+
+        const messages = normalizeResponsesInputToMessages({ input: normalizedInput, instructions });
+
+        if (normalizedTools.length > 0) {
+            const toolInstruction = buildToolSystemInstruction(normalizedTools, normalizedToolChoice, parallelToolCalls === true);
+            messages.unshift({ role: 'system', content: toolInstruction });
+        }
+
         if (messages.length === 0) {
             return res.status(400).json({
                 error: {
@@ -703,6 +871,7 @@ app.post('/v1/responses', async (req, res) => {
         const createdAt = Math.floor(Date.now() / 1000);
         const responseId = `resp_${Date.now()}`;
         const outputMessageId = `msg_${Date.now()}`;
+        const enableTools = normalizedTools.length > 0 && normalizedToolChoice.mode !== 'none';
 
         if (stream) {
             res.setHeader('Content-Type', 'text/event-stream');
@@ -712,6 +881,7 @@ app.post('/v1/responses', async (req, res) => {
             let completionText = '';
             let reasoningText = '';
             let insideReasoning = false;
+            let responseCompleted = false;
 
             sendResponseSseEvent(res, {
                 type: 'response.created',
@@ -773,45 +943,53 @@ app.post('/v1/responses', async (req, res) => {
 
                         if (part.type === 'reasoning') {
                             if (!insideReasoning) {
-                                sendResponseSseEvent(res, {
-                                    type: 'response.output_text.delta',
-                                    response_id: responseId,
-                                    output_index: 0,
-                                    content_index: 0,
-                                    delta: '<think>\n'
-                                });
+                                if (!enableTools) {
+                                    sendResponseSseEvent(res, {
+                                        type: 'response.output_text.delta',
+                                        response_id: responseId,
+                                        output_index: 0,
+                                        content_index: 0,
+                                        delta: '<think>\n'
+                                    });
+                                }
                                 reasoningText += '<think>\n';
                                 insideReasoning = true;
                             }
 
-                            sendResponseSseEvent(res, {
-                                type: 'response.output_text.delta',
-                                response_id: responseId,
-                                output_index: 0,
-                                content_index: 0,
-                                delta
-                            });
-                            reasoningText += delta;
-                        } else if (part.type === 'text') {
-                            if (insideReasoning) {
+                            if (!enableTools) {
                                 sendResponseSseEvent(res, {
                                     type: 'response.output_text.delta',
                                     response_id: responseId,
                                     output_index: 0,
                                     content_index: 0,
-                                    delta: '\n</think>\n\n'
+                                    delta
                                 });
+                            }
+                            reasoningText += delta;
+                        } else if (part.type === 'text') {
+                            if (insideReasoning) {
+                                if (!enableTools) {
+                                    sendResponseSseEvent(res, {
+                                        type: 'response.output_text.delta',
+                                        response_id: responseId,
+                                        output_index: 0,
+                                        content_index: 0,
+                                        delta: '\n</think>\n\n'
+                                    });
+                                }
                                 reasoningText += '\n</think>\n\n';
                                 insideReasoning = false;
                             }
 
-                            sendResponseSseEvent(res, {
-                                type: 'response.output_text.delta',
-                                response_id: responseId,
-                                output_index: 0,
-                                content_index: 0,
-                                delta
-                            });
+                            if (!enableTools) {
+                                sendResponseSseEvent(res, {
+                                    type: 'response.output_text.delta',
+                                    response_id: responseId,
+                                    output_index: 0,
+                                    content_index: 0,
+                                    delta
+                                });
+                            }
                             completionText += delta;
                         }
                     }
@@ -820,17 +998,132 @@ app.post('/v1/responses', async (req, res) => {
                         const messageInfo = event.properties?.info;
                         if (messageInfo?.sessionID === sessionId && messageInfo?.finish === 'stop') {
                             if (insideReasoning) {
-                                sendResponseSseEvent(res, {
-                                    type: 'response.output_text.delta',
-                                    response_id: responseId,
-                                    output_index: 0,
-                                    content_index: 0,
-                                    delta: '\n</think>\n\n'
-                                });
+                                if (!enableTools) {
+                                    sendResponseSseEvent(res, {
+                                        type: 'response.output_text.delta',
+                                        response_id: responseId,
+                                        output_index: 0,
+                                        content_index: 0,
+                                        delta: '\n</think>\n\n'
+                                    });
+                                }
                                 reasoningText += '\n</think>\n\n';
                             }
 
                             const usage = buildResponsesUsage(fullPromptText, completionText, reasoningText);
+                            const toolCalls = enableTools ? extractToolCallsFromText(completionText) : [];
+
+                            if (enableTools && normalizedToolChoice.mode === 'required' && toolCalls.length === 0) {
+                                sendResponseSseEvent(res, {
+                                    type: 'error',
+                                    error: {
+                                        message: 'Model did not produce required function call output'
+                                    }
+                                });
+                                res.end();
+                                responseCompleted = true;
+                                break;
+                            }
+
+                            if (toolCalls.length > 0) {
+                                const validatedCalls = [];
+                                for (const toolCall of toolCalls) {
+                                    const toolDef = normalizedTools.find((tool) => tool.name === toolCall.name);
+                                    if (!toolDef) {
+                                        sendResponseSseEvent(res, {
+                                            type: 'error',
+                                            error: { message: `Model attempted unknown tool: ${toolCall.name}` }
+                                        });
+                                        res.end();
+                                        responseCompleted = true;
+                                        break;
+                                    }
+                                    validatedCalls.push(toolCall);
+                                }
+
+                                if (responseCompleted) {
+                                    break;
+                                }
+
+                                const outputItems = [];
+                                for (let idx = 0; idx < validatedCalls.length; idx += 1) {
+                                    const toolCall = validatedCalls[idx];
+                                    const itemId = `fc_${Date.now()}_${idx}`;
+                                    sendResponseSseEvent(res, {
+                                        type: 'response.output_item.added',
+                                        response_id: responseId,
+                                        output_index: idx,
+                                        item: {
+                                            id: itemId,
+                                            type: 'function_call',
+                                            call_id: toolCall.id,
+                                            name: toolCall.name,
+                                            arguments: '',
+                                            status: 'in_progress'
+                                        }
+                                    });
+
+                                    sendResponseSseEvent(res, {
+                                        type: 'response.function_call_arguments.delta',
+                                        response_id: responseId,
+                                        output_index: idx,
+                                        item_id: itemId,
+                                        delta: toolCall.arguments
+                                    });
+
+                                    sendResponseSseEvent(res, {
+                                        type: 'response.function_call_arguments.done',
+                                        response_id: responseId,
+                                        output_index: idx,
+                                        item_id: itemId,
+                                        arguments: toolCall.arguments
+                                    });
+
+                                    const outputItem = {
+                                        id: itemId,
+                                        type: 'function_call',
+                                        call_id: toolCall.id,
+                                        name: toolCall.name,
+                                        arguments: toolCall.arguments,
+                                        status: 'completed'
+                                    };
+
+                                    sendResponseSseEvent(res, {
+                                        type: 'response.output_item.done',
+                                        response_id: responseId,
+                                        output_index: idx,
+                                        item: outputItem
+                                    });
+
+                                    outputItems.push(outputItem);
+                                }
+
+                                sendResponseSseEvent(res, {
+                                    type: 'response.completed',
+                                    response: {
+                                        id: responseId,
+                                        object: 'response',
+                                        created_at: createdAt,
+                                        status: 'completed',
+                                        model: `${providerId}/${modelId}`,
+                                        output: outputItems,
+                                        usage,
+                                        error: null
+                                    }
+                                });
+
+                                storeResponseState(responseId, {
+                                    sessionId,
+                                    model: `${providerId}/${modelId}`,
+                                    pendingToolCalls: validatedCalls
+                                });
+
+                                res.write('data: [DONE]\n\n');
+                                clearInterval(keepaliveInterval);
+                                res.end();
+                                responseCompleted = true;
+                                break;
+                            }
 
                             sendResponseSseEvent(res, {
                                 type: 'response.output_item.done',
@@ -867,12 +1160,14 @@ app.post('/v1/responses', async (req, res) => {
 
                             storeResponseState(responseId, {
                                 sessionId,
-                                model: `${providerId}/${modelId}`
+                                model: `${providerId}/${modelId}`,
+                                pendingToolCalls: []
                             });
 
                             res.write('data: [DONE]\n\n');
                             clearInterval(keepaliveInterval);
                             res.end();
+                            responseCompleted = true;
                             break;
                         }
                     }
@@ -921,9 +1216,61 @@ app.post('/v1/responses', async (req, res) => {
         const finalOutputText = buildResponsesOutputText(content, reasoningContent);
         const usage = buildResponsesUsage(fullPromptText, content, reasoningContent);
 
+        const toolCalls = enableTools ? extractToolCallsFromText(content) : [];
+        if (enableTools && normalizedToolChoice.mode === 'required' && toolCalls.length === 0) {
+            return res.status(500).json({
+                error: {
+                    message: 'Model did not produce required function call output',
+                    type: 'invalid_response_error'
+                }
+            });
+        }
+
+        if (toolCalls.length > 0) {
+            for (const toolCall of toolCalls) {
+                const toolDef = normalizedTools.find((tool) => tool.name === toolCall.name);
+                if (!toolDef) {
+                    return res.status(400).json({
+                        error: {
+                            message: `Model attempted unknown tool: ${toolCall.name}`,
+                            type: 'invalid_response_error'
+                        }
+                    });
+                }
+            }
+
+            const output = toolCalls.map((toolCall, index) => ({
+                id: `fc_${Date.now()}_${index}`,
+                type: 'function_call',
+                call_id: toolCall.id,
+                name: toolCall.name,
+                arguments: toolCall.arguments,
+                status: 'completed'
+            }));
+
+            storeResponseState(responseId, {
+                sessionId,
+                model: `${providerId}/${modelId}`,
+                pendingToolCalls: toolCalls
+            });
+
+            return res.json({
+                id: responseId,
+                object: 'response',
+                created_at: createdAt,
+                status: 'completed',
+                model: `${providerId}/${modelId}`,
+                output,
+                parallel_tool_calls: parallelToolCalls === true,
+                usage,
+                error: null
+            });
+        }
+
         storeResponseState(responseId, {
             sessionId,
-            model: `${providerId}/${modelId}`
+            model: `${providerId}/${modelId}`,
+            pendingToolCalls: []
         });
 
         return res.json({
@@ -940,7 +1287,7 @@ app.post('/v1/responses', async (req, res) => {
                 content: [{ type: 'output_text', text: finalOutputText }]
             }],
             output_text: finalOutputText,
-            parallel_tool_calls: false,
+            parallel_tool_calls: parallelToolCalls === true,
             usage,
             error: null
         });

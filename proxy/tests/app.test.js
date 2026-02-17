@@ -12,7 +12,10 @@ jest.unstable_mockModule('axios', () => ({
 }));
 
 jest.unstable_mockModule('@opencode-ai/sdk', () => ({
-    createOpencodeClient: jest.fn(() => ({
+    createOpencodeClient: jest.fn(() => {
+        let lastPromptText = '';
+
+        return ({
         config: {
             providers: jest.fn(async () => ({
                 data: {
@@ -34,6 +37,27 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
             })),
             prompt: jest.fn(async (args) => {
                 const promptText = args.body.prompt || '';
+                lastPromptText = promptText;
+
+                if (promptText.includes('Use weather tool') && !promptText.includes('Tool output for weather')) {
+                    return {
+                        data: {
+                            parts: [{
+                                type: 'text',
+                                text: '{"tool_calls":[{"name":"weather","arguments":{"city":"Rome"}}]}'
+                            }]
+                        }
+                    };
+                }
+
+                if (promptText.includes('Tool output for weather')) {
+                    return {
+                        data: {
+                            parts: [{ type: 'text', text: 'The weather in Rome is sunny.' }]
+                        }
+                    };
+                }
+
                 const parts = [{ type: 'text', text: 'Resposta simulada' }];
                 
                 if (promptText.includes('reasoning')) {
@@ -48,12 +72,18 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
         event: {
             subscribe: jest.fn(async () => {
                 const sessionId = 'test-session-id';
-                const mockEvents = [
-                    { type: 'message.part.updated', properties: { part: { type: 'reasoning', sessionID: sessionId }, delta: 'Thinking...' } },
-                    { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: sessionId }, delta: 'Resposta' } },
-                    { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: sessionId }, delta: ' simulada' } },
-                    { type: 'message.updated', properties: { info: { sessionID: sessionId, finish: 'stop' } } }
-                ];
+                const mockEvents = lastPromptText.includes('Use weather tool') && !lastPromptText.includes('Tool output for weather')
+                    ? [
+                        { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: sessionId }, delta: '{"tool_calls":[' } },
+                        { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: sessionId }, delta: '{"name":"weather","arguments":{"city":"Rome"}}]}' } },
+                        { type: 'message.updated', properties: { info: { sessionID: sessionId, finish: 'stop' } } }
+                    ]
+                    : [
+                        { type: 'message.part.updated', properties: { part: { type: 'reasoning', sessionID: sessionId }, delta: 'Thinking...' } },
+                        { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: sessionId }, delta: 'Resposta' } },
+                        { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: sessionId }, delta: ' simulada' } },
+                        { type: 'message.updated', properties: { info: { sessionID: sessionId, finish: 'stop' } } }
+                    ];
 
                 return {
                     stream: (async function* () {
@@ -64,7 +94,8 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
                 };
             })
         }
-    }))
+    });
+    })
 }));
 
 // Importa o app dinamicamente para que o mock seja aplicado
@@ -263,17 +294,70 @@ describe('Proxy OpenAI API', () => {
         expect(res.body.error.message).toContain('previous_response_id');
     });
 
-    test('POST /v1/responses deve rejeitar tools por enquanto', async () => {
+    test('POST /v1/responses deve retornar function_call quando tools forem fornecidas', async () => {
         const res = await request(app)
             .post('/v1/responses')
             .set('Authorization', 'Bearer test-password')
             .send({
                 model: 'opencode/gpt-5-nano',
-                input: 'Teste',
+                input: 'Use weather tool',
                 tools: [{ type: 'function', function: { name: 'weather', parameters: { type: 'object' } } }]
             });
 
-        expect(res.statusCode).toEqual(400);
-        expect(res.body.error.message).toContain('not enabled');
+        expect(res.statusCode).toEqual(200);
+        expect(res.body.object).toEqual('response');
+        expect(res.body.output[0].type).toEqual('function_call');
+        expect(res.body.output[0].name).toEqual('weather');
+        expect(res.body.output[0].arguments).toContain('Rome');
+    });
+
+    test('POST /v1/responses deve aceitar function_call_output e continuar a resposta', async () => {
+        const first = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                model: 'opencode/gpt-5-nano',
+                input: 'Use weather tool',
+                tools: [{ type: 'function', function: { name: 'weather', parameters: { type: 'object' } } }]
+            });
+
+        expect(first.statusCode).toEqual(200);
+        const callId = first.body.output[0].call_id;
+
+        const second = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                previous_response_id: first.body.id,
+                input: [{
+                    type: 'function_call_output',
+                    call_id: callId,
+                    output: { weather: 'sunny' }
+                }]
+            });
+
+        expect(second.statusCode).toEqual(200);
+        expect(second.body.output[0].type).toEqual('message');
+        expect(second.body.output[0].content[0].text).toContain('sunny');
+    });
+
+    test('POST /v1/responses stream deve emitir eventos de function call', async () => {
+        const res = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                model: 'opencode/gpt-5-nano',
+                input: 'Use weather tool',
+                stream: true,
+                tools: [{ type: 'function', function: { name: 'weather', parameters: { type: 'object' } } }]
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.header['content-type']).toContain('text/event-stream');
+        expect(res.text).toContain('"type":"response.output_item.added"');
+        expect(res.text).toContain('"type":"response.function_call_arguments.delta"');
+        expect(res.text).toContain('"type":"response.function_call_arguments.done"');
+        expect(res.text).toContain('"type":"response.completed"');
+        expect(res.text).toContain('data: [DONE]');
     });
 });
