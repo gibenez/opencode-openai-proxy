@@ -468,21 +468,91 @@ function buildFunctionCallOutputItems(toolCalls, pendingByCallId = new Map()) {
     });
 }
 
-function validateFunctionCallOutputs(functionCallOutputs, previousResponseId, previousState) {
+function resolvePreviousResponseForFunctionCallOutputs(functionCallOutputs, explicitPreviousResponseId, explicitPreviousState) {
     if (functionCallOutputs.length === 0) {
-        return { validOutputs: [] };
+        return {
+            previousResponseId: explicitPreviousResponseId || null,
+            previousState: explicitPreviousState || null
+        };
     }
 
-    if (!previousResponseId) {
+    if (explicitPreviousResponseId) {
+        return {
+            previousResponseId: explicitPreviousResponseId,
+            previousState: explicitPreviousState
+        };
+    }
+
+    const matchedResponseIds = new Set();
+
+    for (const outputItem of functionCallOutputs) {
+        const callMatches = [];
+
+        for (const [responseId] of responseState.entries()) {
+            const state = getResponseState(responseId);
+            if (!state) {
+                continue;
+            }
+
+            const hasCall = (state.pendingToolCalls || []).some((call) => call.call_id === outputItem.call_id);
+            if (hasCall) {
+                callMatches.push(responseId);
+            }
+        }
+
+        if (callMatches.length === 0) {
+            return {
+                error: {
+                    message: `Unknown function_call_output call_id: ${outputItem.call_id}`,
+                    type: 'invalid_request_error'
+                }
+            };
+        }
+
+        if (callMatches.length > 1) {
+            return {
+                error: {
+                    message: `Ambiguous function_call_output call_id: ${outputItem.call_id}`,
+                    type: 'invalid_request_error'
+                }
+            };
+        }
+
+        matchedResponseIds.add(callMatches[0]);
+    }
+
+    if (matchedResponseIds.size > 1) {
         return {
             error: {
-                message: 'function_call_output requires previous_response_id',
+                message: 'function_call_output items must target a single previous response',
                 type: 'invalid_request_error'
             }
         };
     }
 
-    if (!previousState) {
+    const inferredPreviousResponseId = [...matchedResponseIds][0];
+    const inferredPreviousState = getResponseState(inferredPreviousResponseId);
+    if (!inferredPreviousState) {
+        return {
+            error: {
+                message: 'Invalid or expired previous_response_id inferred from function_call_output',
+                type: 'invalid_request_error'
+            }
+        };
+    }
+
+    return {
+        previousResponseId: inferredPreviousResponseId,
+        previousState: inferredPreviousState
+    };
+}
+
+function validateFunctionCallOutputs(functionCallOutputs, previousResponseId, previousState) {
+    if (functionCallOutputs.length === 0) {
+        return { validOutputs: [] };
+    }
+
+    if (!previousResponseId || !previousState) {
         return {
             error: {
                 message: 'function_call_output requires a valid previous_response_id',
@@ -977,9 +1047,10 @@ app.post('/v1/responses', async (req, res) => {
 
         const functionCallOutputs = extractFunctionCallOutputs(input);
 
+        let resolvedPreviousResponseId = previousResponseId;
         let previousState = null;
-        if (previousResponseId) {
-            previousState = getResponseState(previousResponseId);
+        if (resolvedPreviousResponseId) {
+            previousState = getResponseState(resolvedPreviousResponseId);
             if (!previousState) {
                 return res.status(400).json({
                     error: {
@@ -990,9 +1061,21 @@ app.post('/v1/responses', async (req, res) => {
             }
         }
 
+        const resolvedPreviousResponse = resolvePreviousResponseForFunctionCallOutputs(
+            functionCallOutputs,
+            resolvedPreviousResponseId,
+            previousState
+        );
+        if (resolvedPreviousResponse.error) {
+            return res.status(400).json({ error: resolvedPreviousResponse.error });
+        }
+
+        resolvedPreviousResponseId = resolvedPreviousResponse.previousResponseId;
+        previousState = resolvedPreviousResponse.previousState;
+
         const continuationValidation = validateFunctionCallOutputs(
             functionCallOutputs,
-            previousResponseId,
+            resolvedPreviousResponseId,
             previousState
         );
         if (continuationValidation.error) {
@@ -1045,7 +1128,7 @@ app.post('/v1/responses', async (req, res) => {
                     : call;
             });
 
-            storeResponseState(previousResponseId, {
+            storeResponseState(resolvedPreviousResponseId, {
                 ...previousState,
                 pendingToolCalls: updatedPendingToolCalls
             });

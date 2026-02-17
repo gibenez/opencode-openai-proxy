@@ -404,6 +404,35 @@ describe('Proxy OpenAI API', () => {
         expect(second.body.output[0].content[0].text).toContain('sunny');
     });
 
+    test('POST /v1/responses deve aceitar function_call_output sem previous_response_id quando call_id for conhecido', async () => {
+        const first = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                model: 'opencode/gpt-5-nano',
+                input: 'Use weather tool',
+                tools: [{ type: 'function', function: { name: 'weather', parameters: { type: 'object' } } }]
+            });
+
+        expect(first.statusCode).toEqual(200);
+        const callId = first.body.output[0].call_id;
+
+        const second = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                input: [{
+                    type: 'function_call_output',
+                    call_id: callId,
+                    output: { weather: 'sunny' }
+                }]
+            });
+
+        expect(second.statusCode).toEqual(200);
+        expect(second.body.output[0].type).toEqual('message');
+        expect(second.body.output[0].content[0].text).toContain('sunny');
+    });
+
     test('POST /v1/responses deve rejeitar function_call_output com call_id desconhecido', async () => {
         const first = await request(app)
             .post('/v1/responses')
@@ -431,6 +460,23 @@ describe('Proxy OpenAI API', () => {
         expect(second.statusCode).toEqual(400);
         expect(second.body.error.type).toEqual('invalid_request_error');
         expect(second.body.error.message).toContain('Unknown function_call_output call_id');
+    });
+
+    test('POST /v1/responses deve rejeitar function_call_output sem previous_response_id e call_id desconhecido', async () => {
+        const res = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                input: [{
+                    type: 'function_call_output',
+                    call_id: 'call_unknown',
+                    output: { weather: 'sunny' }
+                }]
+            });
+
+        expect(res.statusCode).toEqual(400);
+        expect(res.body.error.type).toEqual('invalid_request_error');
+        expect(res.body.error.message).toContain('Unknown function_call_output call_id');
     });
 
     test('POST /v1/responses deve rejeitar reenvio duplicado de function_call_output', async () => {
