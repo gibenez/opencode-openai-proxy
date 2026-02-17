@@ -78,6 +78,32 @@ curl http://localhost:4096/v1/chat/completions \
 ### Streaming Example (SSE)
 Simply add `"stream": true` to the payload and the proxy will send data word by word.
 
+### Responses API Example (Non-Streaming)
+```bash
+curl http://localhost:4096/v1/responses \
+  -H "Authorization: Bearer <YOUR_PASSWORD>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "opencode/gpt-5-nano",
+    "input": "Hello from responses api"
+  }'
+```
+
+### Responses API Streaming Example (SSE)
+```bash
+curl -N http://localhost:4096/v1/responses \
+  -H "Authorization: Bearer <YOUR_PASSWORD>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "opencode/gpt-5-nano",
+    "input": "Stream a short answer",
+    "stream": true
+  }'
+```
+
+Note: in this phase, `/v1/responses` supports text/multimodal + streaming + `previous_response_id`.
+Function/tool calling is implemented in a separate feature branch.
+
 ---
 
 ## 🧪 Automated Tests

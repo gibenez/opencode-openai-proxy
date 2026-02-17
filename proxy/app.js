@@ -6,10 +6,21 @@ import { createOpencodeClient } from '@opencode-ai/sdk';
 
 const app = express();
 const TARGET_PORT = 4097;
+const RESPONSE_STATE_TTL_MS = 30 * 60 * 1000;
+const responseState = new Map();
 
 app.use(cors());
 app.use(bodyParser.json({ limit: '50mb' }));
 app.use(bodyParser.urlencoded({ limit: '50mb', extended: true }));
+
+setInterval(() => {
+    const now = Date.now();
+    for (const [id, state] of responseState.entries()) {
+        if (state.expiresAt <= now) {
+            responseState.delete(id);
+        }
+    }
+}, 60 * 1000).unref();
 
 /**
  * Downloads an image and returns it as a data URI.
@@ -48,6 +59,189 @@ function getClient() {
     }
 
     return createOpencodeClient({ baseUrl, headers });
+}
+
+function parseModel(model) {
+    if (model && model.includes('/')) {
+        const [providerId, modelId] = model.split('/');
+        return { providerId, modelId };
+    }
+
+    return { providerId: 'opencode', modelId: 'big-pickle' };
+}
+
+async function buildPromptPartsAndSystem(messages) {
+    const allParts = [];
+    let fullPromptText = '';
+    let systemPrompt = '';
+
+    for (const m of messages) {
+        if (m.role === 'system') {
+            if (typeof m.content === 'string') {
+                systemPrompt += `${m.content}\n`;
+            } else if (Array.isArray(m.content)) {
+                systemPrompt += `${m.content.map((c) => c.text || '').join('\n')}\n`;
+            }
+            continue;
+        }
+
+        const role = m.role === 'assistant' ? 'Assistant' : 'User';
+
+        if (typeof m.content === 'string') {
+            allParts.push({ type: 'text', text: m.content });
+            fullPromptText += `${role}: ${m.content}\n\n`;
+            continue;
+        }
+
+        if (!Array.isArray(m.content)) {
+            continue;
+        }
+
+        for (const part of m.content) {
+            if (part.type === 'text' || part.type === 'input_text' || part.type === 'output_text') {
+                const text = part.text || '';
+                allParts.push({ type: 'text', text });
+                fullPromptText += `${role}: ${text}\n\n`;
+            } else if (part.type === 'image_url' || part.type === 'input_image') {
+                const url =
+                    typeof part.image_url === 'string'
+                        ? part.image_url
+                        : part.image_url?.url || part.url;
+
+                if (!url) {
+                    continue;
+                }
+
+                try {
+                    const dataUri = await getImageDataUri(url);
+                    const mime = dataUri.split(';')[0].split(':')[1];
+                    allParts.push({
+                        type: 'file',
+                        mime,
+                        url: dataUri,
+                        filename: 'image'
+                    });
+                    fullPromptText += `${role}: [Image attached]\n\n`;
+                } catch (e) {
+                    console.warn('Skipping image due to error:', e.message);
+                }
+            }
+        }
+    }
+
+    return {
+        allParts,
+        fullPromptText: fullPromptText.trim(),
+        systemPrompt: systemPrompt.trim()
+    };
+}
+
+function normalizeResponsesInputToMessages({ input, instructions }) {
+    const messages = [];
+
+    if (instructions && typeof instructions === 'string') {
+        messages.push({ role: 'system', content: instructions });
+    }
+
+    if (typeof input === 'string') {
+        messages.push({ role: 'user', content: input });
+        return messages;
+    }
+
+    if (input && typeof input === 'object' && !Array.isArray(input) && input.role && input.content !== undefined) {
+        messages.push({ role: input.role, content: input.content });
+        return messages;
+    }
+
+    if (!Array.isArray(input)) {
+        return messages;
+    }
+
+    for (const item of input) {
+        if (typeof item === 'string') {
+            messages.push({ role: 'user', content: item });
+            continue;
+        }
+
+        if (!item || typeof item !== 'object') {
+            continue;
+        }
+
+        if (item.type === 'message') {
+            messages.push({ role: item.role || 'user', content: item.content || '' });
+            continue;
+        }
+
+        if (item.type === 'input_text') {
+            messages.push({
+                role: 'user',
+                content: [{ type: 'input_text', text: item.text || '' }]
+            });
+            continue;
+        }
+
+        if (item.type === 'input_image') {
+            messages.push({
+                role: 'user',
+                content: [{ type: 'input_image', image_url: item.image_url || item.url || '' }]
+            });
+            continue;
+        }
+
+        if (item.role && item.content !== undefined) {
+            messages.push({ role: item.role, content: item.content });
+        }
+    }
+
+    return messages;
+}
+
+function storeResponseState(responseId, state) {
+    responseState.set(responseId, {
+        ...state,
+        expiresAt: Date.now() + RESPONSE_STATE_TTL_MS
+    });
+}
+
+function getResponseState(responseId) {
+    const state = responseState.get(responseId);
+    if (!state) {
+        return null;
+    }
+
+    if (state.expiresAt <= Date.now()) {
+        responseState.delete(responseId);
+        return null;
+    }
+
+    return state;
+}
+
+function buildResponsesOutputText(content, reasoningContent) {
+    if (!reasoningContent) {
+        return content;
+    }
+
+    return `<think>\n${reasoningContent}\n</think>\n\n${content}`;
+}
+
+function buildResponsesUsage(promptText, content, reasoningContent) {
+    const inputTokens = Math.ceil(promptText.length / 4);
+    const outputTokens = Math.ceil((content.length + reasoningContent.length) / 4);
+    const reasoningTokens = Math.ceil(reasoningContent.length / 4);
+
+    return {
+        input_tokens: inputTokens,
+        output_tokens: outputTokens,
+        total_tokens: inputTokens + outputTokens,
+        output_tokens_details: {
+            reasoning_tokens: reasoningTokens
+        }
+    };
+}
+
+function sendResponseSseEvent(res, payload) {
+    res.write(`data: ${JSON.stringify(payload)}\n\n`);
 }
 
 // Auth Middleware
@@ -123,59 +317,13 @@ app.post('/v1/chat/completions', async (req, res) => {
             return res.status(400).json({ error: { message: 'messages array is required' } });
         }
 
-        let providerId, modelId;
-
-        if (model && model.includes('/')) {
-            [providerId, modelId] = model.split('/');
-        } else {
-            providerId = 'opencode';
-            modelId = 'big-pickle';
-        }
+        const { providerId, modelId } = parseModel(model);
 
         const client = getClient();
 
         console.log(`Using model: ${providerId}/${modelId}${stream ? ' (streaming)' : ''}`);
 
-        // Process messages to OpenCode Parts
-        const allParts = [];
-        let fullPromptText = '';
-        let systemPrompt = '';
-
-        for (const m of messages) {
-            if (m.role === 'system') {
-                systemPrompt += (typeof m.content === 'string' ? m.content : m.content.map(c => c.text || '').join('\n')) + '\n';
-                continue;
-            }
-
-            const role = m.role === 'user' ? 'User' : 'Assistant';
-            
-            if (typeof m.content === 'string') {
-                allParts.push({ type: 'text', text: m.content });
-                fullPromptText += `${role}: ${m.content}\n\n`;
-            } else if (Array.isArray(m.content)) {
-                for (const part of m.content) {
-                    if (part.type === 'text') {
-                        allParts.push({ type: 'text', text: part.text });
-                        fullPromptText += `${role}: ${part.text}\n\n`;
-                    } else if (part.type === 'image_url') {
-                        const url = typeof part.image_url === 'string' ? part.image_url : part.image_url.url;
-                        try {
-                            const dataUri = await getImageDataUri(url);
-                            const mime = dataUri.split(';')[0].split(':')[1];
-                            allParts.push({
-                                type: 'file',
-                                mime: mime,
-                                url: dataUri,
-                                filename: 'image'
-                            });
-                            fullPromptText += `${role}: [Image attached]\n\n`;
-                        } catch (e) {
-                            console.warn('Skipping image due to error:', e.message);
-                        }
-                    }
-                }
-            }
-        }
+        const { allParts, fullPromptText, systemPrompt } = await buildPromptPartsAndSystem(messages);
         
         // 1. Set active model
         try {
@@ -466,6 +614,344 @@ app.post('/v1/chat/completions', async (req, res) => {
                 message: 'Internal Proxy Error',
                 details: errorMessage
             } 
+        });
+    }
+});
+
+app.post('/v1/responses', async (req, res) => {
+    try {
+        const {
+            input,
+            instructions,
+            model,
+            stream,
+            previous_response_id: previousResponseId,
+            tools,
+            tool_choice: toolChoice,
+            parallel_tool_calls: parallelToolCalls
+        } = req.body || {};
+
+        if (tools || toolChoice !== undefined || parallelToolCalls !== undefined) {
+            return res.status(400).json({
+                error: {
+                    message: 'tools/function calling for /v1/responses is not enabled in this branch yet',
+                    type: 'invalid_request_error'
+                }
+            });
+        }
+
+        if (Array.isArray(input)) {
+            const hasToolOutputs = input.some((item) => item?.type === 'function_call_output');
+            if (hasToolOutputs) {
+                return res.status(400).json({
+                    error: {
+                        message: 'function_call_output is not enabled in this branch yet',
+                        type: 'invalid_request_error'
+                    }
+                });
+            }
+        }
+
+        let previousState = null;
+        if (previousResponseId) {
+            previousState = getResponseState(previousResponseId);
+            if (!previousState) {
+                return res.status(400).json({
+                    error: {
+                        message: 'Invalid or expired previous_response_id',
+                        type: 'invalid_request_error'
+                    }
+                });
+            }
+        }
+
+        const selectedModel = model || previousState?.model || 'opencode/big-pickle';
+        const { providerId, modelId } = parseModel(selectedModel);
+        const client = getClient();
+
+        try {
+            await client.config.update({
+                body: {
+                    activeModel: { providerID: providerId, modelID: modelId }
+                }
+            });
+        } catch (confError) {
+            console.warn('Failed to set active model:', confError.message);
+        }
+
+        let sessionId = previousState?.sessionId;
+        if (!sessionId) {
+            const sessionRes = await client.session.create();
+            sessionId = sessionRes.data?.id;
+            if (!sessionId) {
+                throw new Error('Failed to create session');
+            }
+        }
+
+        const messages = normalizeResponsesInputToMessages({ input, instructions });
+        if (messages.length === 0) {
+            return res.status(400).json({
+                error: {
+                    message: 'input is required when no usable previous_response_id context is provided',
+                    type: 'invalid_request_error'
+                }
+            });
+        }
+
+        const { allParts, fullPromptText, systemPrompt } = await buildPromptPartsAndSystem(messages);
+
+        const createdAt = Math.floor(Date.now() / 1000);
+        const responseId = `resp_${Date.now()}`;
+        const outputMessageId = `msg_${Date.now()}`;
+
+        if (stream) {
+            res.setHeader('Content-Type', 'text/event-stream');
+            res.setHeader('Cache-Control', 'no-cache');
+            res.setHeader('Connection', 'keep-alive');
+
+            let completionText = '';
+            let reasoningText = '';
+            let insideReasoning = false;
+
+            sendResponseSseEvent(res, {
+                type: 'response.created',
+                response: {
+                    id: responseId,
+                    object: 'response',
+                    created_at: createdAt,
+                    status: 'in_progress',
+                    model: `${providerId}/${modelId}`
+                }
+            });
+
+            sendResponseSseEvent(res, {
+                type: 'response.output_item.added',
+                response_id: responseId,
+                output_index: 0,
+                item: {
+                    id: outputMessageId,
+                    type: 'message',
+                    role: 'assistant',
+                    status: 'in_progress',
+                    content: [{ type: 'output_text', text: '' }]
+                }
+            });
+
+            try {
+                client.session.prompt({
+                    path: { id: sessionId },
+                    body: {
+                        model: {
+                            providerID: providerId,
+                            modelID: modelId
+                        },
+                        prompt: fullPromptText,
+                        system: systemPrompt,
+                        parts: allParts
+                    }
+                }).catch((err) => console.warn('Prompt error:', err.message));
+
+                const eventStreamResult = await client.event.subscribe();
+                const eventStream = eventStreamResult.stream;
+
+                const keepaliveInterval = setInterval(() => {
+                    if (!res.destroyed) {
+                        res.write(': keepalive\n\n');
+                    }
+                }, 15000);
+
+                for await (const event of eventStream) {
+                    if (res.destroyed) {
+                        break;
+                    }
+
+                    if (event.type === 'message.part.updated') {
+                        const { part, delta } = event.properties;
+                        if (part.sessionID !== sessionId || !delta) {
+                            continue;
+                        }
+
+                        if (part.type === 'reasoning') {
+                            if (!insideReasoning) {
+                                sendResponseSseEvent(res, {
+                                    type: 'response.output_text.delta',
+                                    response_id: responseId,
+                                    output_index: 0,
+                                    content_index: 0,
+                                    delta: '<think>\n'
+                                });
+                                reasoningText += '<think>\n';
+                                insideReasoning = true;
+                            }
+
+                            sendResponseSseEvent(res, {
+                                type: 'response.output_text.delta',
+                                response_id: responseId,
+                                output_index: 0,
+                                content_index: 0,
+                                delta
+                            });
+                            reasoningText += delta;
+                        } else if (part.type === 'text') {
+                            if (insideReasoning) {
+                                sendResponseSseEvent(res, {
+                                    type: 'response.output_text.delta',
+                                    response_id: responseId,
+                                    output_index: 0,
+                                    content_index: 0,
+                                    delta: '\n</think>\n\n'
+                                });
+                                reasoningText += '\n</think>\n\n';
+                                insideReasoning = false;
+                            }
+
+                            sendResponseSseEvent(res, {
+                                type: 'response.output_text.delta',
+                                response_id: responseId,
+                                output_index: 0,
+                                content_index: 0,
+                                delta
+                            });
+                            completionText += delta;
+                        }
+                    }
+
+                    if (event.type === 'message.updated') {
+                        const messageInfo = event.properties?.info;
+                        if (messageInfo?.sessionID === sessionId && messageInfo?.finish === 'stop') {
+                            if (insideReasoning) {
+                                sendResponseSseEvent(res, {
+                                    type: 'response.output_text.delta',
+                                    response_id: responseId,
+                                    output_index: 0,
+                                    content_index: 0,
+                                    delta: '\n</think>\n\n'
+                                });
+                                reasoningText += '\n</think>\n\n';
+                            }
+
+                            const usage = buildResponsesUsage(fullPromptText, completionText, reasoningText);
+
+                            sendResponseSseEvent(res, {
+                                type: 'response.output_item.done',
+                                response_id: responseId,
+                                output_index: 0,
+                                item: {
+                                    id: outputMessageId,
+                                    type: 'message',
+                                    role: 'assistant',
+                                    status: 'completed',
+                                    content: [{ type: 'output_text', text: `${reasoningText}${completionText}` }]
+                                }
+                            });
+
+                            sendResponseSseEvent(res, {
+                                type: 'response.completed',
+                                response: {
+                                    id: responseId,
+                                    object: 'response',
+                                    created_at: createdAt,
+                                    status: 'completed',
+                                    model: `${providerId}/${modelId}`,
+                                    output: [{
+                                        id: outputMessageId,
+                                        type: 'message',
+                                        role: 'assistant',
+                                        status: 'completed',
+                                        content: [{ type: 'output_text', text: `${reasoningText}${completionText}` }]
+                                    }],
+                                    usage,
+                                    error: null
+                                }
+                            });
+
+                            storeResponseState(responseId, {
+                                sessionId,
+                                model: `${providerId}/${modelId}`
+                            });
+
+                            res.write('data: [DONE]\n\n');
+                            clearInterval(keepaliveInterval);
+                            res.end();
+                            break;
+                        }
+                    }
+                }
+
+                clearInterval(keepaliveInterval);
+            } catch (streamError) {
+                console.error('Responses streaming error:', streamError);
+                if (!res.destroyed) {
+                    sendResponseSseEvent(res, {
+                        type: 'error',
+                        error: {
+                            message: streamError.message
+                        }
+                    });
+                    res.end();
+                }
+            }
+
+            return;
+        }
+
+        const responseRes = await client.session.prompt({
+            path: { id: sessionId },
+            body: {
+                model: {
+                    providerID: providerId,
+                    modelID: modelId
+                },
+                prompt: fullPromptText,
+                system: systemPrompt,
+                parts: allParts
+            }
+        });
+
+        const parts = responseRes.data?.parts || [];
+        const content = parts
+            .filter((p) => p.type === 'text')
+            .map((p) => p.text)
+            .join('\n');
+        const reasoningContent = parts
+            .filter((p) => p.type === 'reasoning')
+            .map((p) => p.text)
+            .join('\n');
+
+        const finalOutputText = buildResponsesOutputText(content, reasoningContent);
+        const usage = buildResponsesUsage(fullPromptText, content, reasoningContent);
+
+        storeResponseState(responseId, {
+            sessionId,
+            model: `${providerId}/${modelId}`
+        });
+
+        return res.json({
+            id: responseId,
+            object: 'response',
+            created_at: createdAt,
+            status: 'completed',
+            model: `${providerId}/${modelId}`,
+            output: [{
+                id: outputMessageId,
+                type: 'message',
+                role: 'assistant',
+                status: 'completed',
+                content: [{ type: 'output_text', text: finalOutputText }]
+            }],
+            output_text: finalOutputText,
+            parallel_tool_calls: false,
+            usage,
+            error: null
+        });
+    } catch (error) {
+        console.error('Responses API Proxy Error:', error);
+        const errorMessage = error.response?.data?.error?.message || error.message || 'Unknown error';
+        return res.status(500).json({
+            error: {
+                message: 'Internal Proxy Error',
+                details: errorMessage
+            }
         });
     }
 });

@@ -191,4 +191,89 @@ describe('Proxy OpenAI API', () => {
         // Validar que o campo reasoning_content não existe
         expect(res.body.choices[0].message.reasoning_content).toBeUndefined();
     });
+
+    test('POST /v1/responses deve retornar formato de response no non-streaming', async () => {
+        const res = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                model: 'opencode/gpt-5-nano',
+                input: 'Olá'
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.body.object).toEqual('response');
+        expect(res.body.status).toEqual('completed');
+        expect(res.body.output[0].type).toEqual('message');
+        expect(res.body.output[0].content[0].type).toEqual('output_text');
+    });
+
+    test('POST /v1/responses deve suportar stream no formato responses', async () => {
+        const res = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                model: 'opencode/gpt-5-nano',
+                input: 'Olá',
+                stream: true
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.header['content-type']).toContain('text/event-stream');
+        expect(res.text).toContain('"type":"response.created"');
+        expect(res.text).toContain('"type":"response.output_text.delta"');
+        expect(res.text).toContain('"type":"response.completed"');
+        expect(res.text).toContain('data: [DONE]');
+    });
+
+    test('POST /v1/responses deve suportar previous_response_id', async () => {
+        const first = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                model: 'opencode/gpt-5-nano',
+                input: 'Primeira mensagem'
+            });
+
+        expect(first.statusCode).toEqual(200);
+        expect(first.body.id).toBeDefined();
+
+        const second = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                previous_response_id: first.body.id,
+                input: 'Continuação'
+            });
+
+        expect(second.statusCode).toEqual(200);
+        expect(second.body.object).toEqual('response');
+    });
+
+    test('POST /v1/responses deve rejeitar previous_response_id inválido', async () => {
+        const res = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                previous_response_id: 'resp_invalido',
+                input: 'teste'
+            });
+
+        expect(res.statusCode).toEqual(400);
+        expect(res.body.error.message).toContain('previous_response_id');
+    });
+
+    test('POST /v1/responses deve rejeitar tools por enquanto', async () => {
+        const res = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                model: 'opencode/gpt-5-nano',
+                input: 'Teste',
+                tools: [{ type: 'function', function: { name: 'weather', parameters: { type: 'object' } } }]
+            });
+
+        expect(res.statusCode).toEqual(400);
+        expect(res.body.error.message).toContain('not enabled');
+    });
 });
