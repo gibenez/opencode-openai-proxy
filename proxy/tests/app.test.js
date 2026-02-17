@@ -479,6 +479,50 @@ describe('Proxy OpenAI API', () => {
         expect(res.body.error.message).toContain('Unknown function_call_output call_id');
     });
 
+    test('POST /v1/responses deve aceitar múltiplos function_call_output sem previous_response_id no mesmo contexto', async () => {
+        const first = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                model: 'opencode/gpt-5-nano',
+                input: 'Use weather tool',
+                tools: [{ type: 'function', function: { name: 'weather', parameters: { type: 'object' } } }]
+            });
+
+        const second = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                model: 'opencode/gpt-5-nano',
+                input: 'Use weather tool',
+                tools: [{ type: 'function', function: { name: 'weather', parameters: { type: 'object' } } }]
+            });
+
+        expect(first.statusCode).toEqual(200);
+        expect(second.statusCode).toEqual(200);
+
+        const resume = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                input: [
+                    {
+                        type: 'function_call_output',
+                        call_id: first.body.output[0].call_id,
+                        output: { weather: 'sunny' }
+                    },
+                    {
+                        type: 'function_call_output',
+                        call_id: second.body.output[0].call_id,
+                        output: { weather: 'sunny' }
+                    }
+                ]
+            });
+
+        expect(resume.statusCode).toEqual(200);
+        expect(resume.body.output[0].type).toEqual('message');
+    });
+
     test('POST /v1/responses deve rejeitar reenvio duplicado de function_call_output', async () => {
         const first = await request(app)
             .post('/v1/responses')

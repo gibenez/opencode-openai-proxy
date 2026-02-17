@@ -468,22 +468,39 @@ function buildFunctionCallOutputItems(toolCalls, pendingByCallId = new Map()) {
     });
 }
 
-function resolvePreviousResponseForFunctionCallOutputs(functionCallOutputs, explicitPreviousResponseId, explicitPreviousState) {
+function resolveFunctionCallOutputTargets(functionCallOutputs, explicitPreviousResponseId, explicitPreviousState) {
     if (functionCallOutputs.length === 0) {
         return {
-            previousResponseId: explicitPreviousResponseId || null,
-            previousState: explicitPreviousState || null
+            continuationState: explicitPreviousState || null,
+            ownershipByCallId: new Map()
         };
     }
 
     if (explicitPreviousResponseId) {
+        if (!explicitPreviousState) {
+            return {
+                error: {
+                    message: 'function_call_output requires a valid previous_response_id',
+                    type: 'invalid_request_error'
+                }
+            };
+        }
+
+        const ownershipByCallId = new Map(
+            (explicitPreviousState.pendingToolCalls || []).map((call) => [
+                call.call_id,
+                { responseId: explicitPreviousResponseId, state: explicitPreviousState, call }
+            ])
+        );
+
         return {
-            previousResponseId: explicitPreviousResponseId,
-            previousState: explicitPreviousState
+            continuationState: explicitPreviousState,
+            ownershipByCallId
         };
     }
 
-    const matchedResponseIds = new Set();
+    const matchedResponsesByCallId = new Map();
+    const matchedResponseStates = [];
 
     for (const outputItem of functionCallOutputs) {
         const callMatches = [];
@@ -518,51 +535,51 @@ function resolvePreviousResponseForFunctionCallOutputs(functionCallOutputs, expl
             };
         }
 
-        matchedResponseIds.add(callMatches[0]);
+        const responseId = callMatches[0];
+        const state = getResponseState(responseId);
+        if (!state) {
+            return {
+                error: {
+                    message: 'Invalid or expired previous_response_id inferred from function_call_output',
+                    type: 'invalid_request_error'
+                }
+            };
+        }
+
+        const call = (state.pendingToolCalls || []).find((pendingCall) => pendingCall.call_id === outputItem.call_id);
+        matchedResponsesByCallId.set(outputItem.call_id, { responseId, state, call });
+        matchedResponseStates.push({ responseId, state });
     }
 
-    if (matchedResponseIds.size > 1) {
+    const sessionIds = new Set(matchedResponseStates.map((entry) => entry.state.sessionId));
+    const modelIds = new Set(matchedResponseStates.map((entry) => entry.state.model));
+    if (sessionIds.size !== 1 || modelIds.size !== 1) {
         return {
             error: {
-                message: 'function_call_output items must target a single previous response',
+                message: 'function_call_output items must target a single continuation context',
                 type: 'invalid_request_error'
             }
         };
     }
 
-    const inferredPreviousResponseId = [...matchedResponseIds][0];
-    const inferredPreviousState = getResponseState(inferredPreviousResponseId);
-    if (!inferredPreviousState) {
-        return {
-            error: {
-                message: 'Invalid or expired previous_response_id inferred from function_call_output',
-                type: 'invalid_request_error'
-            }
-        };
-    }
+    const continuationState = {
+        sessionId: matchedResponseStates[0].state.sessionId,
+        model: matchedResponseStates[0].state.model,
+        pendingToolCalls: [...matchedResponsesByCallId.values()].map((entry) => entry.call)
+    };
 
     return {
-        previousResponseId: inferredPreviousResponseId,
-        previousState: inferredPreviousState
+        continuationState,
+        ownershipByCallId: matchedResponsesByCallId
     };
 }
 
-function validateFunctionCallOutputs(functionCallOutputs, previousResponseId, previousState) {
+function validateFunctionCallOutputs(functionCallOutputs, ownershipByCallId) {
     if (functionCallOutputs.length === 0) {
         return { validOutputs: [] };
     }
 
-    if (!previousResponseId || !previousState) {
-        return {
-            error: {
-                message: 'function_call_output requires a valid previous_response_id',
-                type: 'invalid_request_error'
-            }
-        };
-    }
-
     const seen = new Set();
-    const callStateById = new Map((previousState.pendingToolCalls || []).map((call) => [call.call_id, call]));
     const validOutputs = [];
 
     for (const outputItem of functionCallOutputs) {
@@ -576,8 +593,8 @@ function validateFunctionCallOutputs(functionCallOutputs, previousResponseId, pr
         }
         seen.add(outputItem.call_id);
 
-        const callState = callStateById.get(outputItem.call_id);
-        if (!callState) {
+        const ownership = ownershipByCallId.get(outputItem.call_id);
+        if (!ownership?.call) {
             return {
                 error: {
                     message: `Unknown function_call_output call_id: ${outputItem.call_id}`,
@@ -586,7 +603,7 @@ function validateFunctionCallOutputs(functionCallOutputs, previousResponseId, pr
             };
         }
 
-        if (callState.status === 'completed') {
+        if (ownership.call.status === 'completed') {
             return {
                 error: {
                     message: `function_call_output already submitted for call_id: ${outputItem.call_id}`,
@@ -597,7 +614,8 @@ function validateFunctionCallOutputs(functionCallOutputs, previousResponseId, pr
 
         validOutputs.push({
             output: outputItem,
-            call: callState
+            call: ownership.call,
+            ownerResponseId: ownership.responseId
         });
     }
 
@@ -1047,10 +1065,9 @@ app.post('/v1/responses', async (req, res) => {
 
         const functionCallOutputs = extractFunctionCallOutputs(input);
 
-        let resolvedPreviousResponseId = previousResponseId;
         let previousState = null;
-        if (resolvedPreviousResponseId) {
-            previousState = getResponseState(resolvedPreviousResponseId);
+        if (previousResponseId) {
+            previousState = getResponseState(previousResponseId);
             if (!previousState) {
                 return res.status(400).json({
                     error: {
@@ -1061,23 +1078,19 @@ app.post('/v1/responses', async (req, res) => {
             }
         }
 
-        const resolvedPreviousResponse = resolvePreviousResponseForFunctionCallOutputs(
+        const resolvedTargets = resolveFunctionCallOutputTargets(
             functionCallOutputs,
-            resolvedPreviousResponseId,
+            previousResponseId,
             previousState
         );
-        if (resolvedPreviousResponse.error) {
-            return res.status(400).json({ error: resolvedPreviousResponse.error });
+        if (resolvedTargets.error) {
+            return res.status(400).json({ error: resolvedTargets.error });
         }
 
-        resolvedPreviousResponseId = resolvedPreviousResponse.previousResponseId;
-        previousState = resolvedPreviousResponse.previousState;
+        const ownershipByCallId = resolvedTargets.ownershipByCallId;
+        previousState = resolvedTargets.continuationState;
 
-        const continuationValidation = validateFunctionCallOutputs(
-            functionCallOutputs,
-            resolvedPreviousResponseId,
-            previousState
-        );
+        const continuationValidation = validateFunctionCallOutputs(functionCallOutputs, ownershipByCallId);
         if (continuationValidation.error) {
             return res.status(400).json({ error: continuationValidation.error });
         }
@@ -1121,17 +1134,30 @@ app.post('/v1/responses', async (req, res) => {
 
             normalizedInput = [...passthroughItems, ...toolOutputMessages];
 
-            const updatedPendingToolCalls = (previousState.pendingToolCalls || []).map((call) => {
-                const resolved = validatedFunctionCallOutputs.some(({ output }) => output.call_id === call.call_id);
-                return resolved
-                    ? { ...call, status: 'completed' }
-                    : call;
-            });
+            const resolvedByOwner = new Map();
+            for (const { ownerResponseId, output } of validatedFunctionCallOutputs) {
+                const resolvedSet = resolvedByOwner.get(ownerResponseId) || new Set();
+                resolvedSet.add(output.call_id);
+                resolvedByOwner.set(ownerResponseId, resolvedSet);
+            }
 
-            storeResponseState(resolvedPreviousResponseId, {
-                ...previousState,
-                pendingToolCalls: updatedPendingToolCalls
-            });
+            for (const [ownerResponseId, resolvedCallIds] of resolvedByOwner.entries()) {
+                const ownerState = getResponseState(ownerResponseId);
+                if (!ownerState) {
+                    continue;
+                }
+
+                const updatedPendingToolCalls = (ownerState.pendingToolCalls || []).map((call) => {
+                    return resolvedCallIds.has(call.call_id)
+                        ? { ...call, status: 'completed' }
+                        : call;
+                });
+
+                storeResponseState(ownerResponseId, {
+                    ...ownerState,
+                    pendingToolCalls: updatedPendingToolCalls
+                });
+            }
         }
 
         const messages = normalizeResponsesInputToMessages({ input: normalizedInput, instructions });
