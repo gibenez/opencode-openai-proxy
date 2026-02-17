@@ -517,6 +517,36 @@ async function collectResponseViaEventStream({
     const structuredToolCallBuffers = new Map();
     let structuredToolCallMalformed = false;
 
+    const getSessionIdFromPart = (part, event) => {
+        return part?.sessionID
+            || part?.sessionId
+            || event?.properties?.sessionID
+            || event?.properties?.sessionId
+            || event?.properties?.info?.sessionID
+            || null;
+    };
+
+    const getPartName = (part, delta) => {
+        return part?.name
+            || part?.function?.name
+            || part?.tool?.name
+            || delta?.name
+            || delta?.function?.name
+            || delta?.tool?.name
+            || null;
+    };
+
+    const getPartCallId = (part, delta) => {
+        return part?.call_id
+            || part?.callID
+            || part?.tool_call_id
+            || part?.id
+            || delta?.call_id
+            || delta?.callID
+            || delta?.tool_call_id
+            || null;
+    };
+
     const pushStructuredToolCallUpdate = ({ callId, name, argumentsChunk, argumentsObject }) => {
         if (!name || typeof name !== 'string') {
             return;
@@ -546,12 +576,12 @@ async function collectResponseViaEventStream({
 
     const maybeCaptureStructuredToolCall = (part, delta) => {
         const partType = part?.type;
-        if (partType !== 'function_call' && partType !== 'tool_call') {
+        if (partType !== 'function_call' && partType !== 'tool_call' && partType !== 'tool') {
             return;
         }
 
-        const name = part?.name || part?.function?.name || part?.tool?.name;
-        const callId = part?.call_id || part?.callID || part?.id || null;
+        const name = getPartName(part, delta);
+        const callId = getPartCallId(part, delta);
 
         if (typeof delta === 'string' && delta.length > 0) {
             pushStructuredToolCallUpdate({
@@ -562,7 +592,18 @@ async function collectResponseViaEventStream({
             return;
         }
 
-        const argsFromPart = part?.arguments || part?.function?.arguments || part?.input || null;
+        const argsFromPart = part?.arguments
+            || part?.function?.arguments
+            || part?.tool?.arguments
+            || part?.input
+            || delta?.arguments
+            || delta?.function?.arguments
+            || delta?.tool?.arguments
+            || delta?.input
+            || delta?.input_json
+            || delta?.json
+            || delta?.partial_json
+            || null;
         if (typeof argsFromPart === 'string') {
             pushStructuredToolCallUpdate({
                 callId,
@@ -578,6 +619,43 @@ async function collectResponseViaEventStream({
                 name,
                 argumentsObject: argsFromPart
             });
+        }
+    };
+
+    const processMessagePartEvent = (event, part, delta) => {
+        const partSessionId = getSessionIdFromPart(part, event);
+        if (partSessionId !== sessionId) {
+            return;
+        }
+
+        const partType = part?.type || 'unknown';
+        messagePartTypeCounts[partType] = (messagePartTypeCounts[partType] || 0) + 1;
+
+        maybeCaptureStructuredToolCall(part, delta);
+
+        if (partType === 'reasoning') {
+            const deltaText = typeof delta === 'string' ? delta : delta?.text;
+            if (!deltaText) {
+                return;
+            }
+            if (!insideReasoning) {
+                reasoningText += '<think>\n';
+                insideReasoning = true;
+            }
+            reasoningText += deltaText;
+            return;
+        }
+
+        if (partType === 'text') {
+            const deltaText = typeof delta === 'string' ? delta : delta?.text;
+            if (!deltaText) {
+                return;
+            }
+            if (insideReasoning) {
+                reasoningText += '\n</think>\n\n';
+                insideReasoning = false;
+            }
+            completionText += deltaText;
         }
     };
 
@@ -614,40 +692,24 @@ async function collectResponseViaEventStream({
 
         eventTypeCounts[event.type] = (eventTypeCounts[event.type] || 0) + 1;
 
-        if (event.type === 'message.part.updated') {
-            const { part, delta } = event.properties;
-            if (part.sessionID !== sessionId) {
+        if (event.type === 'message.part.updated' || event.type === 'message.part.delta') {
+            const { part, delta } = event.properties || {};
+            if (!part) {
                 continue;
             }
 
-            const partType = part.type || 'unknown';
-            messagePartTypeCounts[partType] = (messagePartTypeCounts[partType] || 0) + 1;
-
-            maybeCaptureStructuredToolCall(part, delta);
-
-            if (part.type === 'reasoning') {
-                if (!delta) {
-                    continue;
-                }
-                if (!insideReasoning) {
-                    reasoningText += '<think>\n';
-                    insideReasoning = true;
-                }
-                reasoningText += delta;
-            } else if (part.type === 'text') {
-                if (!delta) {
-                    continue;
-                }
-                if (insideReasoning) {
-                    reasoningText += '\n</think>\n\n';
-                    insideReasoning = false;
-                }
-                completionText += delta;
-            }
+            processMessagePartEvent(event, part, delta);
         }
 
         if (event.type === 'message.updated') {
             const messageInfo = event.properties?.info;
+            const messageParts = Array.isArray(event.properties?.message?.parts)
+                ? event.properties.message.parts
+                : [];
+            for (const messagePart of messageParts) {
+                processMessagePartEvent(event, messagePart, null);
+            }
+
             if (messageInfo?.sessionID === sessionId && messageInfo?.finish === 'stop') {
                 if (insideReasoning) {
                     reasoningText += '\n</think>\n\n';

@@ -113,6 +113,7 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
                         const shouldEmitToolCalls = (lastPromptText.includes('Use weather tool') || lastPromptText.includes('Use weather and time tool'))
                             && !lastPromptText.includes('Tool output for weather');
                         const shouldEmitFormatterCall = lastPromptText.includes('Use formatter tool');
+                        const shouldEmitFormatterDeltaCall = lastPromptText.includes('Use formatter delta tool');
 
                         const mockEvents = shouldEmitToolCalls
                             ? [
@@ -125,6 +126,24 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
                             : shouldEmitFormatterCall
                                 ? [
                                     { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: sessionId }, delta: '{"tool_calls":[{"name":"format_final_json_response","arguments":{"facts":["Cats sleep 12-16 hours"]}}]}' } },
+                                    { type: 'message.updated', properties: { info: { sessionID: sessionId, finish: 'stop' } } }
+                                ]
+                            : shouldEmitFormatterDeltaCall
+                                ? [
+                                    {
+                                        type: 'message.part.delta',
+                                        properties: {
+                                            part: {
+                                                type: 'tool',
+                                                sessionID: sessionId,
+                                                call_id: 'call_fmt_1',
+                                                name: 'format_final_json_response'
+                                            },
+                                            delta: {
+                                                arguments: '{"facts":["Cats sleep 12-16 hours"]}'
+                                            }
+                                        }
+                                    },
                                     { type: 'message.updated', properties: { info: { sessionID: sessionId, finish: 'stop' } } }
                                 ]
                             : [
@@ -454,6 +473,24 @@ describe('Proxy OpenAI API', () => {
         expect(res.statusCode).toEqual(200);
         expect(res.body.output[0].type).toEqual('function_call');
         expect(res.body.output[0].name).toEqual('format_final_json_response');
+    });
+
+    test('POST /v1/responses deve extrair function_call de message.part.delta em structured parser mode', async () => {
+        const res = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                model: 'opencode/gpt-5-nano',
+                input: 'Use formatter delta tool',
+                tools: [
+                    { type: 'function', function: { name: 'format_final_json_response', parameters: { type: 'object' } } }
+                ]
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.body.output[0].type).toEqual('function_call');
+        expect(res.body.output[0].name).toEqual('format_final_json_response');
+        expect(res.body.output[0].arguments).toContain('Cats sleep 12-16 hours');
     });
 
     test('POST /v1/responses deve falhar explicitamente quando tool_choice=required não gera tool call', async () => {
