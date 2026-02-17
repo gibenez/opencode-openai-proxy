@@ -437,13 +437,22 @@ function normalizeTools(tools) {
     return { tools: normalized };
 }
 
+function hasStructuredOutputFormatterTool(tools) {
+    return tools.some((tool) => tool.name === 'format_final_json_response');
+}
+
 function buildToolSystemInstruction(tools, toolChoice, parallelToolCalls) {
     if (!tools.length) {
         return '';
     }
 
+    const hasStructuredFormatter = hasStructuredOutputFormatterTool(tools);
     const toolList = tools.map((tool) => {
-        return `- ${tool.name}: ${tool.description || 'No description'}; parameters schema: ${JSON.stringify(tool.parameters)}`;
+        const schema = tool.parameters || {};
+        const summary = hasStructuredFormatter
+            ? `schema bytes=${safeJsonLength(schema)}, schema depth=${estimateSchemaDepth(schema)}`
+            : `parameters schema: ${JSON.stringify(schema)}`;
+        return `- ${tool.name}: ${tool.description || 'No description'}; ${summary}`;
     }).join('\n');
 
     let policy = 'Use tools only when needed.';
@@ -457,6 +466,22 @@ function buildToolSystemInstruction(tools, toolChoice, parallelToolCalls) {
 
     const parallelPolicy = parallelToolCalls ? 'Parallel calls are allowed.' : 'Return at most one tool call.';
 
+    if (hasStructuredFormatter) {
+        const formatterPolicy = toolChoice.mode === 'none'
+            ? 'Do not call tools. Respond normally.'
+            : 'When producing the final answer, call tool "format_final_json_response" exactly once with the final structured payload. Do not output free-form text as final answer.';
+
+        return [
+            'TOOLS AVAILABLE:',
+            toolList,
+            policy,
+            parallelPolicy,
+            formatterPolicy,
+            'If you call tools, respond with ONLY valid JSON in this shape:',
+            '{"tool_calls":[{"name":"tool_name","arguments":{}}]}'
+        ].join('\n');
+    }
+
     return [
         'TOOLS AVAILABLE:',
         toolList,
@@ -466,6 +491,100 @@ function buildToolSystemInstruction(tools, toolChoice, parallelToolCalls) {
         '{"tool_calls":[{"name":"tool_name","arguments":{}}]}',
         'If no tool call is needed, respond with normal assistant text.'
     ].join('\n');
+}
+
+async function collectResponseViaEventStream({
+    client,
+    sessionId,
+    providerId,
+    modelId,
+    fullPromptText,
+    systemPrompt,
+    allParts,
+    requestId,
+    requestStartedAt
+}) {
+    const eventStreamResult = await client.event.subscribe();
+    const eventStream = eventStreamResult.stream;
+
+    let completionText = '';
+    let reasoningText = '';
+    let insideReasoning = false;
+    let completed = false;
+    let promptError = null;
+
+    debugLog('responses.non_stream_via_events.subscribe_ready', {
+        requestId,
+        elapsedMs: Date.now() - requestStartedAt,
+        sessionId
+    });
+
+    client.session.prompt({
+        path: { id: sessionId },
+        body: {
+            model: {
+                providerID: providerId,
+                modelID: modelId
+            },
+            prompt: fullPromptText,
+            system: systemPrompt,
+            parts: allParts
+        }
+    }).catch((error) => {
+        promptError = error;
+        debugLog('responses.non_stream_via_events.prompt_error', {
+            requestId,
+            elapsedMs: Date.now() - requestStartedAt,
+            error: getErrorDetails(error)
+        });
+    });
+
+    for await (const event of eventStream) {
+        if (promptError) {
+            throw promptError;
+        }
+
+        if (event.type === 'message.part.updated') {
+            const { part, delta } = event.properties;
+            if (part.sessionID !== sessionId || !delta) {
+                continue;
+            }
+
+            if (part.type === 'reasoning') {
+                if (!insideReasoning) {
+                    reasoningText += '<think>\n';
+                    insideReasoning = true;
+                }
+                reasoningText += delta;
+            } else if (part.type === 'text') {
+                if (insideReasoning) {
+                    reasoningText += '\n</think>\n\n';
+                    insideReasoning = false;
+                }
+                completionText += delta;
+            }
+        }
+
+        if (event.type === 'message.updated') {
+            const messageInfo = event.properties?.info;
+            if (messageInfo?.sessionID === sessionId && messageInfo?.finish === 'stop') {
+                if (insideReasoning) {
+                    reasoningText += '\n</think>\n\n';
+                }
+                completed = true;
+                break;
+            }
+        }
+    }
+
+    if (!completed) {
+        if (promptError) {
+            throw promptError;
+        }
+        throw new Error('Responses event stream ended before completion');
+    }
+
+    return { completionText, reasoningText };
 }
 
 function extractToolCallsFromText(text) {
@@ -1331,6 +1450,14 @@ app.post('/v1/responses', async (req, res) => {
         if (normalizedTools.length > 0) {
             const toolInstruction = buildToolSystemInstruction(normalizedTools, normalizedToolChoice, parallelToolCalls === true);
             messages.unshift({ role: 'system', content: toolInstruction });
+
+            debugLog('responses.tools.instruction_built', {
+                requestId,
+                mode: hasStructuredOutputFormatterTool(normalizedTools)
+                    ? 'langchain_structured_policy'
+                    : 'default_tools_policy',
+                instructionChars: toolInstruction.length
+            });
         }
 
         if (messages.length === 0) {
@@ -1790,45 +1917,74 @@ app.post('/v1/responses', async (req, res) => {
             return;
         }
 
-        debugLog('responses.non_stream.prompt.start', {
-            requestId,
-            elapsedMs: Date.now() - requestStartedAt,
-            sessionId,
-            model: `${providerId}/${modelId}`,
-            promptChars: fullPromptText.length,
-            systemChars: systemPrompt.length,
-            partsCount: allParts.length
-        });
+        const useEventStreamForNonStreaming = hasStructuredOutputFormatterTool(normalizedTools);
+        let content = '';
+        let reasoningContent = '';
 
-        const responseRes = await client.session.prompt({
-            path: { id: sessionId },
-            body: {
-                model: {
-                    providerID: providerId,
-                    modelID: modelId
-                },
-                prompt: fullPromptText,
-                system: systemPrompt,
-                parts: allParts
-            }
-        });
+        if (useEventStreamForNonStreaming) {
+            debugLog('responses.non_stream.execution_mode', {
+                requestId,
+                mode: 'event_stream'
+            });
+            const collected = await collectResponseViaEventStream({
+                client,
+                sessionId,
+                providerId,
+                modelId,
+                fullPromptText,
+                systemPrompt,
+                allParts,
+                requestId,
+                requestStartedAt
+            });
+            content = collected.completionText;
+            reasoningContent = collected.reasoningText;
+        } else {
+            debugLog('responses.non_stream.execution_mode', {
+                requestId,
+                mode: 'single_prompt'
+            });
 
-        debugLog('responses.non_stream.prompt.returned', {
-            requestId,
-            elapsedMs: Date.now() - requestStartedAt,
-            partsCount: Array.isArray(responseRes.data?.parts) ? responseRes.data.parts.length : 0,
-            dataType: typeof responseRes.data
-        });
+            debugLog('responses.non_stream.prompt.start', {
+                requestId,
+                elapsedMs: Date.now() - requestStartedAt,
+                sessionId,
+                model: `${providerId}/${modelId}`,
+                promptChars: fullPromptText.length,
+                systemChars: systemPrompt.length,
+                partsCount: allParts.length
+            });
 
-        const parts = responseRes.data?.parts || [];
-        const content = parts
-            .filter((p) => p.type === 'text')
-            .map((p) => p.text)
-            .join('\n');
-        const reasoningContent = parts
-            .filter((p) => p.type === 'reasoning')
-            .map((p) => p.text)
-            .join('\n');
+            const responseRes = await client.session.prompt({
+                path: { id: sessionId },
+                body: {
+                    model: {
+                        providerID: providerId,
+                        modelID: modelId
+                    },
+                    prompt: fullPromptText,
+                    system: systemPrompt,
+                    parts: allParts
+                }
+            });
+
+            debugLog('responses.non_stream.prompt.returned', {
+                requestId,
+                elapsedMs: Date.now() - requestStartedAt,
+                partsCount: Array.isArray(responseRes.data?.parts) ? responseRes.data.parts.length : 0,
+                dataType: typeof responseRes.data
+            });
+
+            const parts = responseRes.data?.parts || [];
+            content = parts
+                .filter((p) => p.type === 'text')
+                .map((p) => p.text)
+                .join('\n');
+            reasoningContent = parts
+                .filter((p) => p.type === 'reasoning')
+                .map((p) => p.text)
+                .join('\n');
+        }
 
         const finalOutputText = buildResponsesOutputText(content, reasoningContent);
         const usage = buildResponsesUsage(fullPromptText, content, reasoningContent);
