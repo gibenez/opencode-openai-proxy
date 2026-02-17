@@ -512,6 +512,74 @@ async function collectResponseViaEventStream({
     let insideReasoning = false;
     let completed = false;
     let promptError = null;
+    const eventTypeCounts = {};
+    const messagePartTypeCounts = {};
+    const structuredToolCallBuffers = new Map();
+    let structuredToolCallMalformed = false;
+
+    const pushStructuredToolCallUpdate = ({ callId, name, argumentsChunk, argumentsObject }) => {
+        if (!name || typeof name !== 'string') {
+            return;
+        }
+
+        const key = callId || name;
+        const current = structuredToolCallBuffers.get(key) || {
+            call_id: callId || createId('call'),
+            name,
+            argumentChunks: [],
+            argumentObject: null
+        };
+
+        current.call_id = callId || current.call_id;
+        current.name = name || current.name;
+
+        if (typeof argumentsChunk === 'string' && argumentsChunk.length > 0) {
+            current.argumentChunks.push(argumentsChunk);
+        }
+
+        if (argumentsObject && typeof argumentsObject === 'object' && !Array.isArray(argumentsObject)) {
+            current.argumentObject = argumentsObject;
+        }
+
+        structuredToolCallBuffers.set(key, current);
+    };
+
+    const maybeCaptureStructuredToolCall = (part, delta) => {
+        const partType = part?.type;
+        if (partType !== 'function_call' && partType !== 'tool_call') {
+            return;
+        }
+
+        const name = part?.name || part?.function?.name || part?.tool?.name;
+        const callId = part?.call_id || part?.callID || part?.id || null;
+
+        if (typeof delta === 'string' && delta.length > 0) {
+            pushStructuredToolCallUpdate({
+                callId,
+                name,
+                argumentsChunk: delta
+            });
+            return;
+        }
+
+        const argsFromPart = part?.arguments || part?.function?.arguments || part?.input || null;
+        if (typeof argsFromPart === 'string') {
+            pushStructuredToolCallUpdate({
+                callId,
+                name,
+                argumentsChunk: argsFromPart
+            });
+            return;
+        }
+
+        if (argsFromPart && typeof argsFromPart === 'object' && !Array.isArray(argsFromPart)) {
+            pushStructuredToolCallUpdate({
+                callId,
+                name,
+                argumentsObject: argsFromPart
+            });
+        }
+    };
 
     debugLog('responses.non_stream_via_events.subscribe_ready', {
         requestId,
@@ -544,19 +612,32 @@ async function collectResponseViaEventStream({
             throw promptError;
         }
 
+        eventTypeCounts[event.type] = (eventTypeCounts[event.type] || 0) + 1;
+
         if (event.type === 'message.part.updated') {
             const { part, delta } = event.properties;
-            if (part.sessionID !== sessionId || !delta) {
+            if (part.sessionID !== sessionId) {
                 continue;
             }
 
+            const partType = part.type || 'unknown';
+            messagePartTypeCounts[partType] = (messagePartTypeCounts[partType] || 0) + 1;
+
+            maybeCaptureStructuredToolCall(part, delta);
+
             if (part.type === 'reasoning') {
+                if (!delta) {
+                    continue;
+                }
                 if (!insideReasoning) {
                     reasoningText += '<think>\n';
                     insideReasoning = true;
                 }
                 reasoningText += delta;
             } else if (part.type === 'text') {
+                if (!delta) {
+                    continue;
+                }
                 if (insideReasoning) {
                     reasoningText += '\n</think>\n\n';
                     insideReasoning = false;
@@ -577,6 +658,46 @@ async function collectResponseViaEventStream({
         }
     }
 
+    const structuredToolCalls = [];
+    for (const candidate of structuredToolCallBuffers.values()) {
+        const argumentsString = candidate.argumentObject
+            ? JSON.stringify(candidate.argumentObject)
+            : candidate.argumentChunks.join('');
+        const fallbackArguments = argumentsString && argumentsString.trim().length > 0
+            ? argumentsString
+            : '{}';
+
+        let parsedArguments;
+        try {
+            parsedArguments = JSON.parse(fallbackArguments);
+        } catch (error) {
+            structuredToolCallMalformed = true;
+            continue;
+        }
+
+        if (!parsedArguments || typeof parsedArguments !== 'object' || Array.isArray(parsedArguments)) {
+            structuredToolCallMalformed = true;
+            continue;
+        }
+
+        structuredToolCalls.push({
+            call_id: candidate.call_id || createId('call'),
+            name: candidate.name,
+            arguments: JSON.stringify(parsedArguments)
+        });
+    }
+
+    debugLog('responses.non_stream_via_events.summary', {
+        requestId,
+        elapsedMs: Date.now() - requestStartedAt,
+        eventTypeCounts,
+        messagePartTypeCounts,
+        completionChars: completionText.length,
+        reasoningChars: reasoningText.length,
+        structuredToolCallCount: structuredToolCalls.length,
+        structuredToolCallMalformed
+    });
+
     if (!completed) {
         if (promptError) {
             throw promptError;
@@ -584,7 +705,12 @@ async function collectResponseViaEventStream({
         throw new Error('Responses event stream ended before completion');
     }
 
-    return { completionText, reasoningText };
+    return {
+        completionText,
+        reasoningText,
+        structuredToolCalls,
+        structuredToolCallMalformed
+    };
 }
 
 function extractToolCallsFromText(text) {
@@ -1951,6 +2077,8 @@ app.post('/v1/responses', async (req, res) => {
         const useEventStreamForNonStreaming = hasStructuredOutputFormatterTool(normalizedTools);
         let content = '';
         let reasoningContent = '';
+        let extractedToolCalls = { toolCalls: [], malformed: false };
+        let extractionSource = 'text_fallback';
 
         if (useEventStreamForNonStreaming) {
             debugLog('responses.non_stream.execution_mode', {
@@ -1970,6 +2098,14 @@ app.post('/v1/responses', async (req, res) => {
             });
             content = collected.completionText;
             reasoningContent = collected.reasoningText;
+
+            if (collected.structuredToolCalls.length > 0 || collected.structuredToolCallMalformed) {
+                extractedToolCalls = {
+                    toolCalls: collected.structuredToolCalls,
+                    malformed: collected.structuredToolCallMalformed
+                };
+                extractionSource = 'structured_event_parts';
+            }
         } else {
             debugLog('responses.non_stream.execution_mode', {
                 requestId,
@@ -2020,14 +2156,17 @@ app.post('/v1/responses', async (req, res) => {
         const finalOutputText = buildResponsesOutputText(content, reasoningContent);
         const usage = buildResponsesUsage(fullPromptText, content, reasoningContent);
 
-        const extractedToolCalls = enableTools
-            ? extractToolCallsFromText(content)
-            : { toolCalls: [], malformed: false };
+        if (enableTools && extractedToolCalls.toolCalls.length === 0 && extractedToolCalls.malformed === false) {
+            extractedToolCalls = extractToolCallsFromText(content);
+            extractionSource = 'text_json';
+        }
+
         const toolCalls = extractedToolCalls.toolCalls;
         const finalizerCalled = toolCalls.some((call) => call.name === 'format_final_json_response');
 
         debugLog('responses.non_stream.tool_extraction', {
             requestId,
+            extractionSource,
             extractedCount: toolCalls.length,
             malformed: extractedToolCalls.malformed,
             structuredParserMode,
