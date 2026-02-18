@@ -969,12 +969,142 @@ function extractToolCallsFromText(text) {
         return { toolCalls: [], malformed: false };
     }
 
+    const normalizeParsedToolCalls = (parsed) => {
+        const objectPayload = Array.isArray(parsed)
+            ? parsed.find((item) => item && typeof item === 'object' && (Object.prototype.hasOwnProperty.call(item, 'tool_calls') || Object.prototype.hasOwnProperty.call(item, 'tool_call')))
+            : parsed;
+
+        const hasToolCallField = Object.prototype.hasOwnProperty.call(objectPayload || {}, 'tool_calls')
+            || Object.prototype.hasOwnProperty.call(objectPayload || {}, 'tool_call');
+
+        const rawCalls = Array.isArray(objectPayload?.tool_calls)
+            ? objectPayload.tool_calls
+            : objectPayload?.tool_call
+                ? [objectPayload.tool_call]
+                : [];
+
+        if (hasToolCallField && !rawCalls.length) {
+            return { toolCalls: [], malformed: true };
+        }
+
+        if (!rawCalls.length) {
+            return { toolCalls: [], malformed: false };
+        }
+
+        const normalized = [];
+        for (const call of rawCalls) {
+            const callName = call?.name || call?.function?.name;
+            if (!call || typeof call !== 'object' || typeof callName !== 'string' || !callName.trim()) {
+                return { toolCalls: [], malformed: true };
+            }
+
+            let argsObj = call.arguments ?? call.function?.arguments ?? call.input ?? {};
+            if (typeof argsObj === 'string') {
+                const normalizedArgsString = argsObj.trim();
+                try {
+                    argsObj = normalizedArgsString.length > 0 ? JSON.parse(normalizedArgsString) : {};
+                } catch (error) {
+                    return { toolCalls: [], malformed: true };
+                }
+            }
+
+            if (!argsObj || typeof argsObj !== 'object' || Array.isArray(argsObj)) {
+                return { toolCalls: [], malformed: true };
+            }
+
+            normalized.push({
+                call_id: typeof call.call_id === 'string' && call.call_id.trim()
+                    ? call.call_id
+                    : (typeof call.id === 'string' && call.id.trim() ? call.id : createId('call')),
+                name: callName,
+                arguments: JSON.stringify(argsObj)
+            });
+        }
+
+        return { toolCalls: normalized, malformed: false };
+    };
+
+    const extractObjectSnippetsAroundKeyword = (sourceText, keyword) => {
+        const snippets = [];
+        let searchFrom = 0;
+
+        while (searchFrom < sourceText.length && snippets.length < 12) {
+            const keywordIndex = sourceText.indexOf(keyword, searchFrom);
+            if (keywordIndex === -1) {
+                break;
+            }
+
+            let start = keywordIndex;
+            while (start >= 0 && sourceText[start] !== '{') {
+                start -= 1;
+            }
+
+            if (start < 0) {
+                searchFrom = keywordIndex + keyword.length;
+                continue;
+            }
+
+            let depth = 0;
+            let end = -1;
+            let inString = false;
+            let escaped = false;
+            for (let i = start; i < sourceText.length; i += 1) {
+                const ch = sourceText[i];
+                if (inString) {
+                    if (escaped) {
+                        escaped = false;
+                    } else if (ch === '\\') {
+                        escaped = true;
+                    } else if (ch === '"') {
+                        inString = false;
+                    }
+                    continue;
+                }
+
+                if (ch === '"') {
+                    inString = true;
+                    continue;
+                }
+
+                if (ch === '{') {
+                    depth += 1;
+                    continue;
+                }
+
+                if (ch === '}') {
+                    depth -= 1;
+                    if (depth === 0) {
+                        end = i;
+                        break;
+                    }
+                }
+            }
+
+            if (end > start) {
+                snippets.push(sourceText.slice(start, end + 1));
+                searchFrom = end + 1;
+            } else {
+                searchFrom = keywordIndex + keyword.length;
+            }
+        }
+
+        return snippets;
+    };
+
     const trimmed = text.trim();
     const candidates = [trimmed];
     const fenced = text.match(/```json\s*([\s\S]*?)\s*```/i);
     if (fenced && fenced[1]) {
         candidates.push(fenced[1].trim());
     }
+
+    const genericFenced = text.match(/```\s*([\s\S]*?)\s*```/i);
+    if (genericFenced && genericFenced[1]) {
+        candidates.push(genericFenced[1].trim());
+    }
+
+    candidates.push(...extractObjectSnippetsAroundKeyword(text, '"tool_calls"'));
+    candidates.push(...extractObjectSnippetsAroundKeyword(text, '"tool_call"'));
 
     const mentionsToolCalls = /"tool_calls"|"tool_call"/i.test(text);
     const maybeJson = mentionsToolCalls || /^\s*[\[{]/.test(trimmed) || Boolean(fenced?.[1]);
@@ -993,62 +1123,14 @@ function extractToolCallsFromText(text) {
             continue;
         }
 
-        const hasToolCallField = Object.prototype.hasOwnProperty.call(parsed || {}, 'tool_calls')
-            || Object.prototype.hasOwnProperty.call(parsed || {}, 'tool_call');
-
-        const rawCalls = Array.isArray(parsed?.tool_calls)
-            ? parsed.tool_calls
-            : parsed?.tool_call
-                ? [parsed.tool_call]
-                : [];
-
-        if (hasToolCallField && !rawCalls.length) {
+        const normalizedResult = normalizeParsedToolCalls(parsed);
+        if (normalizedResult.malformed) {
             malformed = true;
             continue;
         }
 
-        if (!rawCalls.length) {
-            continue;
-        }
-
-        const normalized = [];
-        let invalidCall = false;
-
-        for (const call of rawCalls) {
-            if (!call || typeof call !== 'object' || typeof call.name !== 'string' || !call.name.trim()) {
-                invalidCall = true;
-                break;
-            }
-
-            let argsObj = call.arguments;
-            if (typeof argsObj === 'string') {
-                try {
-                    argsObj = JSON.parse(argsObj);
-                } catch (error) {
-                    invalidCall = true;
-                    break;
-                }
-            }
-
-            if (!argsObj || typeof argsObj !== 'object' || Array.isArray(argsObj)) {
-                invalidCall = true;
-                break;
-            }
-
-            normalized.push({
-                call_id: typeof call.call_id === 'string' && call.call_id.trim() ? call.call_id : createId('call'),
-                name: call.name,
-                arguments: JSON.stringify(argsObj)
-            });
-        }
-
-        if (invalidCall) {
-            malformed = true;
-            continue;
-        }
-
-        if (normalized.length) {
-            return { toolCalls: normalized, malformed: false };
+        if (normalizedResult.toolCalls.length) {
+            return { toolCalls: normalizedResult.toolCalls, malformed: false };
         }
     }
 
@@ -2078,6 +2160,14 @@ app.post('/v1/responses', async (req, res) => {
                                 finalizerCalled
                             });
 
+                            if (extracted.malformed) {
+                                debugLog('responses.stream.tool_extraction_malformed_preview', {
+                                    requestId,
+                                    previewStart: completionText.slice(0, 320),
+                                    previewEnd: completionText.slice(-320)
+                                });
+                            }
+
                             if (enableTools && extracted.malformed) {
                                 sendResponseSseEvent(res, {
                                     type: 'error',
@@ -2427,6 +2517,15 @@ app.post('/v1/responses', async (req, res) => {
             structuredParserMode,
             finalizerCalled
         });
+
+        if (extractedToolCalls.malformed) {
+            debugLog('responses.non_stream.tool_extraction_malformed_preview', {
+                requestId,
+                extractionSource,
+                previewStart: content.slice(0, 320),
+                previewEnd: content.slice(-320)
+            });
+        }
 
         if (enableTools && extractedToolCalls.malformed) {
             return res.status(500).json({

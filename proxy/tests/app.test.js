@@ -105,6 +105,17 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
                     };
                 }
 
+                if (promptText.includes('Use formatter prose tool')) {
+                    return {
+                        data: {
+                            parts: [{
+                                type: 'text',
+                                text: 'I will now format the response.\n```\n{"tool_calls":[{"name":"format_final_json_response","arguments":{"facts":["Cats sleep 12-16 hours"]}}]}\n```'
+                            }]
+                        }
+                    };
+                }
+
                 if (promptText.includes('Tool output for weather')) {
                     return {
                         data: {
@@ -137,6 +148,7 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
                         const shouldEmitToolCalls = (lastPromptText.includes('Use weather tool') || lastPromptText.includes('Use weather and time tool'))
                             && !lastPromptText.includes('Tool output for weather');
                         const shouldEmitFormatterCall = lastPromptText.includes('Use formatter tool');
+                        const shouldEmitFormatterProseCall = lastPromptText.includes('Use formatter prose tool');
                         const shouldEmitFormatterDeltaCall = lastPromptText.includes('Use formatter delta tool');
 
                         const mockEvents = shouldEmitToolCalls
@@ -150,6 +162,11 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
                             : shouldEmitFormatterCall
                                 ? [
                                     { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: sessionId }, delta: '{"tool_calls":[{"name":"format_final_json_response","arguments":{"facts":["Cats sleep 12-16 hours"]}}]}' } },
+                                    { type: 'message.updated', properties: { info: { sessionID: sessionId, finish: 'stop' } } }
+                                ]
+                            : shouldEmitFormatterProseCall
+                                ? [
+                                    { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: sessionId }, delta: 'I will now format the response.\n```\n{"tool_calls":[{"name":"format_final_json_response","arguments":{"facts":["Cats sleep 12-16 hours"]}}]}\n```' } },
                                     { type: 'message.updated', properties: { info: { sessionID: sessionId, finish: 'stop' } } }
                                 ]
                             : shouldEmitFormatterDeltaCall
@@ -532,6 +549,23 @@ describe('Proxy OpenAI API', () => {
         expect(res.body.output[0].type).toEqual('function_call');
         expect(res.body.output[0].name).toEqual('format_final_json_response');
         expect(res.body.output[0].arguments).toContain('Cats sleep 12-16 hours');
+    });
+
+    test('POST /v1/responses deve extrair function_call quando tool json vier com prose', async () => {
+        const res = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                model: 'opencode/gpt-5-nano',
+                input: 'Use formatter prose tool',
+                tools: [
+                    { type: 'function', function: { name: 'format_final_json_response', parameters: { type: 'object' } } }
+                ]
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.body.output[0].type).toEqual('function_call');
+        expect(res.body.output[0].name).toEqual('format_final_json_response');
     });
 
     test('POST /v1/responses deve falhar explicitamente quando tool_choice=required não gera tool call', async () => {
