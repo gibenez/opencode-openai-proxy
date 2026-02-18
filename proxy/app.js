@@ -646,50 +646,6 @@ async function collectResponseViaEventStream({
     let textFromPartChars = 0;
     let reasoningFromDeltaChars = 0;
     let reasoningFromPartChars = 0;
-    const toolEventSamples = [];
-    const sessionDiffToolSamples = [];
-    const maxToolSamples = 5;
-
-    const sanitizeValue = (value, depth = 0) => {
-        if (value === null || value === undefined) {
-            return value;
-        }
-
-        if (typeof value === 'string') {
-            return value.length > 240 ? `${value.slice(0, 240)}...[truncated]` : value;
-        }
-
-        if (typeof value === 'number' || typeof value === 'boolean') {
-            return value;
-        }
-
-        if (Array.isArray(value)) {
-            if (depth >= 2) {
-                return `[array:${value.length}]`;
-            }
-            return value.slice(0, 5).map((item) => sanitizeValue(item, depth + 1));
-        }
-
-        if (typeof value === 'object') {
-            if (depth >= 2) {
-                return `[object:${Object.keys(value).slice(0, 8).join(',')}]`;
-            }
-            const out = {};
-            for (const key of Object.keys(value).slice(0, 12)) {
-                out[key] = sanitizeValue(value[key], depth + 1);
-            }
-            return out;
-        }
-
-        return String(value);
-    };
-
-    const pushSample = (bucket, sample) => {
-        if (bucket.length >= maxToolSamples) {
-            return;
-        }
-        bucket.push(sample);
-    };
 
     const getSessionIdFromPart = (part, event) => {
         return part?.sessionID
@@ -910,33 +866,7 @@ async function collectResponseViaEventStream({
                 continue;
             }
 
-            if (part.type === 'tool' || part.type === 'tool_call' || part.type === 'function_call') {
-                pushSample(toolEventSamples, {
-                    eventType: event.type,
-                    partType: part.type,
-                    partKeys: Object.keys(part || {}),
-                    deltaType: typeof delta,
-                    deltaKeys: delta && typeof delta === 'object' ? Object.keys(delta) : [],
-                    partPreview: sanitizeValue(part),
-                    deltaPreview: sanitizeValue(delta)
-                });
-            }
-
             processMessagePartEvent(event, part, delta);
-        }
-
-        if (event.type === 'session.diff') {
-            const diffPayload = event.properties?.diff || event.properties?.patch || event.properties;
-            const asText = typeof diffPayload === 'string'
-                ? diffPayload
-                : JSON.stringify(diffPayload || {});
-            if (typeof asText === 'string' && asText.toLowerCase().includes('tool')) {
-                pushSample(sessionDiffToolSamples, {
-                    eventType: event.type,
-                    keys: diffPayload && typeof diffPayload === 'object' ? Object.keys(diffPayload).slice(0, 12) : [],
-                    preview: sanitizeValue(diffPayload)
-                });
-            }
         }
 
         if (event.type === 'message.updated') {
@@ -945,17 +875,6 @@ async function collectResponseViaEventStream({
                 ? event.properties.message.parts
                 : [];
             for (const messagePart of messageParts) {
-                if (messagePart?.type === 'tool' || messagePart?.type === 'tool_call' || messagePart?.type === 'function_call') {
-                    pushSample(toolEventSamples, {
-                        eventType: 'message.updated.parts',
-                        partType: messagePart.type,
-                        partKeys: Object.keys(messagePart || {}),
-                        deltaType: 'none',
-                        deltaKeys: [],
-                        partPreview: sanitizeValue(messagePart),
-                        deltaPreview: null
-                    });
-                }
                 processMessagePartEvent(event, messagePart, null);
             }
 
@@ -1010,9 +929,7 @@ async function collectResponseViaEventStream({
         reasoningFromDeltaChars,
         reasoningFromPartChars,
         structuredToolCallCount: structuredToolCalls.length,
-        structuredToolCallMalformed,
-        toolEventSamples,
-        sessionDiffToolSamples
+        structuredToolCallMalformed
     });
 
     if (!completed) {
@@ -2236,14 +2153,6 @@ app.post('/v1/responses', async (req, res) => {
                                 finalizerCalled
                             });
 
-                            if (extracted.malformed) {
-                                debugLog('responses.stream.tool_extraction_malformed_preview', {
-                                    requestId,
-                                    previewStart: completionText.slice(0, 320),
-                                    previewEnd: completionText.slice(-320)
-                                });
-                            }
-
                             if (enableTools && extracted.malformed) {
                                 sendResponseSseEvent(res, {
                                     type: 'error',
@@ -2593,15 +2502,6 @@ app.post('/v1/responses', async (req, res) => {
             structuredParserMode,
             finalizerCalled
         });
-
-        if (extractedToolCalls.malformed) {
-            debugLog('responses.non_stream.tool_extraction_malformed_preview', {
-                requestId,
-                extractionSource,
-                previewStart: content.slice(0, 320),
-                previewEnd: content.slice(-320)
-            });
-        }
 
         if (enableTools && extractedToolCalls.malformed) {
             return res.status(500).json({
