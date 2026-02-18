@@ -533,6 +533,40 @@ function hasStructuredOutputFormatterTool(tools) {
     return tools.some((tool) => tool.name === 'format_final_json_response');
 }
 
+function stripSystemReminderArtifacts(value) {
+    if (typeof value !== 'string') {
+        return value;
+    }
+
+    const reminderTag = '<system-reminder>';
+    const reminderIndex = value.indexOf(reminderTag);
+    if (reminderIndex === -1) {
+        return value;
+    }
+
+    return value.slice(0, reminderIndex).trimEnd();
+}
+
+function sanitizeToolArgumentsValue(value) {
+    if (typeof value === 'string') {
+        return stripSystemReminderArtifacts(value);
+    }
+
+    if (Array.isArray(value)) {
+        return value.map((item) => sanitizeToolArgumentsValue(item));
+    }
+
+    if (value && typeof value === 'object') {
+        const out = {};
+        for (const [key, nested] of Object.entries(value)) {
+            out[key] = sanitizeToolArgumentsValue(nested);
+        }
+        return out;
+    }
+
+    return value;
+}
+
 function buildToolSystemInstruction(tools, toolChoice, parallelToolCalls) {
     if (!tools.length) {
         return '';
@@ -541,10 +575,7 @@ function buildToolSystemInstruction(tools, toolChoice, parallelToolCalls) {
     const hasStructuredFormatter = hasStructuredOutputFormatterTool(tools);
     const toolList = tools.map((tool) => {
         const schema = tool.parameters || {};
-        const summary = hasStructuredFormatter
-            ? `schema bytes=${safeJsonLength(schema)}, schema depth=${estimateSchemaDepth(schema)}`
-            : `parameters schema: ${JSON.stringify(schema)}`;
-        return `- ${tool.name}: ${tool.description || 'No description'}; ${summary}`;
+        return `- ${tool.name}: ${tool.description || 'No description'}; parameters schema: ${JSON.stringify(schema)}`;
     }).join('\n');
 
     let policy = 'Use tools only when needed.';
@@ -570,7 +601,8 @@ function buildToolSystemInstruction(tools, toolChoice, parallelToolCalls) {
             parallelPolicy,
             formatterPolicy,
             'If you call tools, respond with ONLY valid JSON in this shape:',
-            '{"tool_calls":[{"name":"tool_name","arguments":{}}]}'
+            '{"tool_calls":[{"name":"tool_name","arguments":{}}]}',
+            'Do not include markdown, prose, or system-reminder content in tool arguments values.'
         ].join('\n');
     }
 
@@ -1045,6 +1077,8 @@ function extractToolCallsFromText(text) {
             if (!argsObj || typeof argsObj !== 'object' || Array.isArray(argsObj)) {
                 return { toolCalls: [], malformed: true };
             }
+
+            argsObj = sanitizeToolArgumentsValue(argsObj);
 
             normalized.push({
                 call_id: typeof call.call_id === 'string' && call.call_id.trim()
