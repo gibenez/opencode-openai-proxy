@@ -9,7 +9,12 @@ const app = express();
 const TARGET_PORT = 4097;
 const RESPONSE_STATE_TTL_MS = 30 * 60 * 1000;
 const responseState = new Map();
+const UPSTREAM_TOOL_POLICY_TTL_MS = 60 * 1000;
 const LOG_LEVEL = (process.env.LOG_LEVEL || 'info').toLowerCase();
+let cachedUpstreamToolPolicy = {
+    expiresAt: 0,
+    tools: null
+};
 
 function isDebugLoggingEnabled() {
     return LOG_LEVEL === 'debug';
@@ -122,6 +127,59 @@ function getErrorDetails(error) {
             }
             : null
     };
+}
+
+async function getDisabledUpstreamToolsPolicy(client, requestId) {
+    if (cachedUpstreamToolPolicy.tools && cachedUpstreamToolPolicy.expiresAt > Date.now()) {
+        debugLog('responses.upstream.tools_disabled', {
+            requestId,
+            source: 'cache',
+            disabledCount: Object.keys(cachedUpstreamToolPolicy.tools).length,
+            sample: Object.keys(cachedUpstreamToolPolicy.tools).slice(0, 8)
+        });
+        return cachedUpstreamToolPolicy.tools;
+    }
+
+    let toolIdsRes;
+    try {
+        toolIdsRes = await client.tool.ids();
+    } catch (error) {
+        throw new Error(`Unable to fetch upstream tool IDs: ${error.message || 'unknown error'}`);
+    }
+
+    const rawData = toolIdsRes?.data;
+    const toolIds = Array.isArray(rawData)
+        ? rawData
+        : Array.isArray(rawData?.toolIds)
+            ? rawData.toolIds
+            : Array.isArray(rawData?.tools)
+                ? rawData.tools
+                : null;
+
+    if (!Array.isArray(toolIds)) {
+        throw new Error('Unable to fetch upstream tool IDs: unexpected response shape');
+    }
+
+    const toolsPolicy = {};
+    for (const toolId of toolIds) {
+        if (typeof toolId === 'string' && toolId.trim()) {
+            toolsPolicy[toolId] = false;
+        }
+    }
+
+    cachedUpstreamToolPolicy = {
+        expiresAt: Date.now() + UPSTREAM_TOOL_POLICY_TTL_MS,
+        tools: toolsPolicy
+    };
+
+    debugLog('responses.upstream.tools_disabled', {
+        requestId,
+        source: 'network',
+        disabledCount: Object.keys(toolsPolicy).length,
+        sample: Object.keys(toolsPolicy).slice(0, 8)
+    });
+
+    return toolsPolicy;
 }
 
 app.use(cors());
@@ -501,6 +559,7 @@ async function collectResponseViaEventStream({
     fullPromptText,
     systemPrompt,
     allParts,
+    upstreamToolsPolicy,
     requestId,
     requestStartedAt
 }) {
@@ -718,6 +777,7 @@ async function collectResponseViaEventStream({
             },
             prompt: fullPromptText,
             system: systemPrompt,
+            tools: upstreamToolsPolicy,
             parts: allParts
         }
     }).catch((error) => {
@@ -1653,6 +1713,7 @@ app.post('/v1/responses', async (req, res) => {
         const selectedModel = model || previousState?.model || 'opencode/big-pickle';
         const { providerId, modelId } = parseModel(selectedModel);
         const client = getClient();
+        const upstreamToolsPolicy = await getDisabledUpstreamToolsPolicy(client, requestId);
 
         try {
             await client.config.update({
@@ -1857,6 +1918,7 @@ app.post('/v1/responses', async (req, res) => {
                         },
                         prompt: fullPromptText,
                         system: systemPrompt,
+                        tools: upstreamToolsPolicy,
                         parts: allParts
                     }
                 }).catch((err) => console.warn('Prompt error:', err.message));
@@ -2238,6 +2300,7 @@ app.post('/v1/responses', async (req, res) => {
                 fullPromptText,
                 systemPrompt,
                 allParts,
+                upstreamToolsPolicy,
                 requestId,
                 requestStartedAt
             });
@@ -2276,6 +2339,7 @@ app.post('/v1/responses', async (req, res) => {
                     },
                     prompt: fullPromptText,
                     system: systemPrompt,
+                    tools: upstreamToolsPolicy,
                     parts: allParts
                 }
             });

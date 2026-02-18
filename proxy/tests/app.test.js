@@ -14,6 +14,7 @@ jest.unstable_mockModule('axios', () => ({
 jest.unstable_mockModule('@opencode-ai/sdk', () => ({
     createOpencodeClient: jest.fn(() => {
         let lastPromptText = '';
+        let lastPromptBody = null;
 
         return ({
         config: {
@@ -38,6 +39,7 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
             prompt: jest.fn(async (args) => {
                 const promptText = args.body.prompt || '';
                 lastPromptText = promptText;
+                lastPromptBody = args.body || null;
                 const systemText = args.body.system || '';
 
                 if (promptText.includes('Inspect langchain policy bypass')) {
@@ -48,6 +50,23 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
                                 text: systemText.includes('TOOLS AVAILABLE:')
                                     ? 'proxy-policy-applied'
                                     : 'proxy-policy-bypassed'
+                            }]
+                        }
+                    };
+                }
+
+                if (promptText.includes('Inspect upstream tools policy')) {
+                    const toolsPolicy = args.body.tools || {};
+                    const disabled = Object.entries(toolsPolicy)
+                        .filter(([, value]) => value === false)
+                        .map(([key]) => key)
+                        .sort();
+
+                    return {
+                        data: {
+                            parts: [{
+                                type: 'text',
+                                text: disabled.join(',')
                             }]
                         }
                     };
@@ -105,6 +124,11 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
                 };
             })
         },
+        tool: {
+            ids: jest.fn(async () => ({
+                data: ['bash', 'task']
+            }))
+        },
         event: {
             subscribe: jest.fn(async () => {
                 const sessionId = 'test-session-id';
@@ -159,6 +183,9 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
                     })()
                 };
             })
+        },
+        __test: {
+            getLastPromptBody: () => lastPromptBody
         }
     });
     })
@@ -438,6 +465,20 @@ describe('Proxy OpenAI API', () => {
         expect(res.body.object).toEqual('response');
         expect(res.body.output[0].type).toEqual('function_call');
         expect(res.body.output[0].name).toEqual('weather');
+    });
+
+    test('POST /v1/responses deve desabilitar tools internos upstream', async () => {
+        const res = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                model: 'opencode/gpt-5-nano',
+                input: 'Inspect upstream tools policy'
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.body.output[0].type).toEqual('message');
+        expect(res.body.output[0].content[0].text).toEqual('bash,task');
     });
 
     test('POST /v1/responses deve falhar quando structured parser mode não gera function call', async () => {
