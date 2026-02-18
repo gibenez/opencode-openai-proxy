@@ -129,6 +129,40 @@ function getErrorDetails(error) {
     };
 }
 
+function summarizeResponsesPayload(payload) {
+    const output = Array.isArray(payload?.output) ? payload.output : [];
+    const firstOutput = output[0] || null;
+
+    const summary = {
+        id: payload?.id,
+        status: payload?.status,
+        outputCount: output.length,
+        firstOutputType: firstOutput?.type || null,
+        firstOutputName: firstOutput?.name || null,
+        firstOutputCallId: firstOutput?.call_id || null,
+        firstOutputId: firstOutput?.id || null,
+        hasOutputText: typeof payload?.output_text === 'string',
+        outputTextPreview: typeof payload?.output_text === 'string'
+            ? payload.output_text.slice(0, 220)
+            : null
+    };
+
+    if (firstOutput?.type === 'function_call') {
+        summary.firstOutputArgumentsPreview = typeof firstOutput.arguments === 'string'
+            ? firstOutput.arguments.slice(0, 320)
+            : null;
+    }
+
+    if (firstOutput?.type === 'message') {
+        const text = firstOutput?.content?.find((part) => part?.type === 'output_text')?.text;
+        summary.firstMessageTextPreview = typeof text === 'string'
+            ? text.slice(0, 220)
+            : null;
+    }
+
+    return summary;
+}
+
 async function getDisabledUpstreamToolsPolicy(client, requestId) {
     if (cachedUpstreamToolPolicy.tools && cachedUpstreamToolPolicy.expiresAt > Date.now()) {
         debugLog('responses.upstream.tools_disabled', {
@@ -1928,7 +1962,7 @@ app.post('/v1/responses', async (req, res) => {
                 const responseId = createId('resp');
                 const outputMessageId = createId('msg');
 
-                return res.json({
+                const payload = {
                     id: responseId,
                     object: 'response',
                     created_at: createdAt,
@@ -1950,7 +1984,15 @@ app.post('/v1/responses', async (req, res) => {
                         output_tokens_details: { reasoning_tokens: 0 }
                     },
                     error: null
+                };
+
+                debugLog('responses.response_payload', {
+                    requestId,
+                    elapsedMs: Date.now() - requestStartedAt,
+                    payload: summarizeResponsesPayload(payload)
                 });
+
+                return res.json(payload);
             }
 
             return res.status(400).json({
@@ -2602,7 +2644,7 @@ app.post('/v1/responses', async (req, res) => {
                 }))
             });
 
-            return res.json({
+            const payload = {
                 id: responseId,
                 object: 'response',
                 created_at: createdAt,
@@ -2612,7 +2654,15 @@ app.post('/v1/responses', async (req, res) => {
                 parallel_tool_calls: parallelToolCalls === true,
                 usage,
                 error: null
+            };
+
+            debugLog('responses.response_payload', {
+                requestId,
+                elapsedMs: Date.now() - requestStartedAt,
+                payload: summarizeResponsesPayload(payload)
             });
+
+            return res.json(payload);
         }
 
         storeResponseState(responseId, {
@@ -2621,7 +2671,7 @@ app.post('/v1/responses', async (req, res) => {
             pendingToolCalls: []
         });
 
-        return res.json({
+        const payload = {
             id: responseId,
             object: 'response',
             created_at: createdAt,
@@ -2638,7 +2688,15 @@ app.post('/v1/responses', async (req, res) => {
             parallel_tool_calls: parallelToolCalls === true,
             usage,
             error: null
+        };
+
+        debugLog('responses.response_payload', {
+            requestId,
+            elapsedMs: Date.now() - requestStartedAt,
+            payload: summarizeResponsesPayload(payload)
         });
+
+        return res.json(payload);
     } catch (error) {
         console.error('Responses API Proxy Error:', error);
         debugLog('responses.request.error', {
