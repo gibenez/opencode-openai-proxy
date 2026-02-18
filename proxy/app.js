@@ -575,6 +575,11 @@ async function collectResponseViaEventStream({
     const messagePartTypeCounts = {};
     const structuredToolCallBuffers = new Map();
     let structuredToolCallMalformed = false;
+    const partTextCursor = new Map();
+    let textFromDeltaChars = 0;
+    let textFromPartChars = 0;
+    let reasoningFromDeltaChars = 0;
+    let reasoningFromPartChars = 0;
     const toolEventSamples = [];
     const sessionDiffToolSamples = [];
     const maxToolSamples = 5;
@@ -736,8 +741,33 @@ async function collectResponseViaEventStream({
 
         maybeCaptureStructuredToolCall(part, delta);
 
+        const partKey = part?.id
+            || `${partType}:${part?.messageID || event?.properties?.messageID || ''}:${partSessionId || ''}`;
+
+        const resolvePartTextDelta = () => {
+            if (typeof delta === 'string' && delta.length > 0) {
+                return { text: delta, source: 'delta' };
+            }
+
+            if (typeof part?.text === 'string') {
+                const previousLength = partTextCursor.get(partKey) || 0;
+                const currentLength = part.text.length;
+                const suffix = currentLength > previousLength
+                    ? part.text.slice(previousLength)
+                    : '';
+                partTextCursor.set(partKey, currentLength);
+                return { text: suffix, source: 'part' };
+            }
+
+            if (delta && typeof delta === 'object' && typeof delta.text === 'string' && delta.text.length > 0) {
+                return { text: delta.text, source: 'delta' };
+            }
+
+            return { text: '', source: 'none' };
+        };
+
         if (partType === 'reasoning') {
-            const deltaText = typeof delta === 'string' ? delta : delta?.text;
+            const { text: deltaText, source } = resolvePartTextDelta();
             if (!deltaText) {
                 return;
             }
@@ -746,11 +776,17 @@ async function collectResponseViaEventStream({
                 insideReasoning = true;
             }
             reasoningText += deltaText;
+            if (source === 'delta') {
+                reasoningFromDeltaChars += deltaText.length;
+            }
+            if (source === 'part') {
+                reasoningFromPartChars += deltaText.length;
+            }
             return;
         }
 
         if (partType === 'text') {
-            const deltaText = typeof delta === 'string' ? delta : delta?.text;
+            const { text: deltaText, source } = resolvePartTextDelta();
             if (!deltaText) {
                 return;
             }
@@ -759,6 +795,12 @@ async function collectResponseViaEventStream({
                 insideReasoning = false;
             }
             completionText += deltaText;
+            if (source === 'delta') {
+                textFromDeltaChars += deltaText.length;
+            }
+            if (source === 'part') {
+                textFromPartChars += deltaText.length;
+            }
         }
     };
 
@@ -897,6 +939,10 @@ async function collectResponseViaEventStream({
         messagePartTypeCounts,
         completionChars: completionText.length,
         reasoningChars: reasoningText.length,
+        textFromDeltaChars,
+        textFromPartChars,
+        reasoningFromDeltaChars,
+        reasoningFromPartChars,
         structuredToolCallCount: structuredToolCalls.length,
         structuredToolCallMalformed,
         toolEventSamples,
