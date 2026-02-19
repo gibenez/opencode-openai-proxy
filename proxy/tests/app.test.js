@@ -14,6 +14,7 @@ jest.unstable_mockModule('axios', () => ({
 jest.unstable_mockModule('@opencode-ai/sdk', () => ({
     createOpencodeClient: jest.fn(() => {
         let lastPromptText = '';
+        let lastSystemText = '';
         let lastPromptBody = null;
 
         return ({
@@ -39,6 +40,7 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
             prompt: jest.fn(async (args) => {
                 const promptText = args.body.prompt || '';
                 lastPromptText = promptText;
+                lastSystemText = args.body.system || '';
                 lastPromptBody = args.body || null;
                 const systemText = args.body.system || '';
 
@@ -50,6 +52,19 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
                                 text: systemText.includes('TOOLS AVAILABLE:')
                                     ? 'proxy-policy-applied'
                                     : 'proxy-policy-bypassed'
+                            }]
+                        }
+                    };
+                }
+
+                if (promptText.includes('Inspect formatter tool name policy')) {
+                    return {
+                        data: {
+                            parts: [{
+                                type: 'text',
+                                text: systemText.includes('call tool "format_custom_response" exactly once')
+                                    ? 'formatter-name-matched'
+                                    : 'formatter-name-missing'
                             }]
                         }
                     };
@@ -158,6 +173,7 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
                     stream: (async function* () {
                         const shouldEmitToolCalls = (lastPromptText.includes('Use weather tool') || lastPromptText.includes('Use weather and time tool'))
                             && !lastPromptText.includes('Tool output for weather');
+                        const shouldInspectFormatterPolicy = lastPromptText.includes('Inspect formatter tool name policy');
                         const shouldEmitFormatterCall = lastPromptText.includes('Use formatter tool');
                         const shouldEmitFormatterProseCall = lastPromptText.includes('Use formatter prose tool');
                         const shouldEmitFormatterReminderLeak = lastPromptText.includes('Use formatter with reminder leak');
@@ -171,6 +187,19 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
                                     : '{"name":"weather","arguments":{"city":"Rome"}}]}' } },
                                 { type: 'message.updated', properties: { info: { sessionID: sessionId, finish: 'stop' } } }
                             ]
+                            : shouldInspectFormatterPolicy
+                                ? [
+                                    {
+                                        type: 'message.part.updated',
+                                        properties: {
+                                            part: { type: 'text', sessionID: sessionId },
+                                            delta: lastSystemText.includes('call tool "format_custom_response" exactly once')
+                                                ? '{"tool_calls":[{"name":"format_custom_response","arguments":{"facts":["ok"]}}]}'
+                                                : '{"tool_calls":[{"name":"format_final_json_response","arguments":{"facts":["wrong"]}}]}'
+                                        }
+                                    },
+                                    { type: 'message.updated', properties: { info: { sessionID: sessionId, finish: 'stop' } } }
+                                ]
                             : shouldEmitFormatterCall
                                 ? [
                                     { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: sessionId }, delta: '{"tool_calls":[{"name":"format_final_json_response","arguments":{"facts":["Cats sleep 12-16 hours"]}}]}' } },
@@ -531,6 +560,40 @@ describe('Proxy OpenAI API', () => {
         expect(res.statusCode).toEqual(500);
         expect(res.body.error.type).toEqual('invalid_response_error');
         expect(res.body.error.message).toContain('Structured parser mode requires at least one function call output');
+    });
+
+    test('POST /v1/responses deve ativar structured parser mode por prefixo de formatter tool', async () => {
+        const res = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                model: 'opencode/gpt-5-nano',
+                input: 'Pergunta simples sem uso de ferramenta',
+                tools: [
+                    { type: 'function', function: { name: 'format_custom_response', parameters: { type: 'object' } } }
+                ]
+            });
+
+        expect(res.statusCode).toEqual(500);
+        expect(res.body.error.type).toEqual('invalid_response_error');
+        expect(res.body.error.message).toContain('Structured parser mode requires at least one function call output');
+    });
+
+    test('POST /v1/responses deve usar nome exato do formatter tool no prompt de política', async () => {
+        const res = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                model: 'opencode/gpt-5-nano',
+                input: 'Inspect formatter tool name policy',
+                tools: [
+                    { type: 'function', function: { name: 'format_custom_response', parameters: { type: 'object' } } }
+                ]
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.body.output[0].type).toEqual('function_call');
+        expect(res.body.output[0].name).toEqual('format_custom_response');
     });
 
     test('POST /v1/responses deve aceitar structured parser mode quando houver function call', async () => {

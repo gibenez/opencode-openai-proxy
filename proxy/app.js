@@ -12,7 +12,14 @@ const responseState = new Map();
 const UPSTREAM_TOOL_POLICY_TTL_MS = 60 * 1000;
 const LOG_LEVEL = (process.env.LOG_LEVEL || 'info').toLowerCase();
 const RESPONSES_OBJECT = 'response';
-const FORMATTER_TOOL_NAME = 'format_final_json_response';
+const DEFAULT_RESPONSE_FORMATTER_TOOL_NAME = 'format_';
+const RESPONSE_FORMATTER_TOOL_NAME = (() => {
+    const configured = process.env.RESPONSE_FORMATTER_TOOL_PREFIX;
+    if (typeof configured !== 'string' || configured.trim().length === 0) {
+        return DEFAULT_RESPONSE_FORMATTER_TOOL_NAME;
+    }
+    return configured.trim();
+})();
 const ERROR_TYPE_INVALID_REQUEST = 'invalid_request_error';
 const ERROR_TYPE_INVALID_RESPONSE = 'invalid_response_error';
 let cachedUpstreamToolPolicy = {
@@ -547,8 +554,19 @@ function normalizeTools(tools) {
     return { tools: normalized };
 }
 
-function hasStructuredOutputFormatterTool(tools) {
-    return tools.some((tool) => tool.name === FORMATTER_TOOL_NAME);
+function getResponseFormatterToolName(tools) {
+    const normalizedPrefix = RESPONSE_FORMATTER_TOOL_NAME.toLowerCase();
+    for (const tool of tools) {
+        if (typeof tool?.name !== 'string') {
+            continue;
+        }
+
+        if (tool.name.toLowerCase().startsWith(normalizedPrefix)) {
+            return tool.name;
+        }
+    }
+
+    return null;
 }
 
 function stripSystemReminderArtifacts(value) {
@@ -590,7 +608,8 @@ function buildToolSystemInstruction(tools, toolChoice, parallelToolCalls) {
         return '';
     }
 
-    const hasStructuredFormatter = hasStructuredOutputFormatterTool(tools);
+    const formatterToolName = getResponseFormatterToolName(tools);
+    const hasStructuredFormatter = Boolean(formatterToolName);
     const toolList = tools.map((tool) => {
         const schema = tool.parameters || {};
         return `- ${tool.name}: ${tool.description || 'No description'}; parameters schema: ${JSON.stringify(schema)}`;
@@ -610,7 +629,7 @@ function buildToolSystemInstruction(tools, toolChoice, parallelToolCalls) {
     if (hasStructuredFormatter) {
         const formatterPolicy = toolChoice.mode === 'none'
             ? 'Do not call tools. Respond normally.'
-            : `When producing the final answer, call tool "${FORMATTER_TOOL_NAME}" exactly once with the final structured payload. Do not output free-form text as final answer.`;
+            : `When producing the final answer, call tool "${formatterToolName}" exactly once with the final structured payload. Do not output free-form text as final answer.`;
 
         return [
             'TOOLS AVAILABLE:',
@@ -1904,12 +1923,13 @@ app.post('/v1/responses', async (req, res) => {
         const messages = normalizeResponsesInputToMessages({ input: normalizedInput, instructions });
 
         if (normalizedTools.length > 0) {
+            const formatterToolName = getResponseFormatterToolName(normalizedTools);
             const toolInstruction = buildToolSystemInstruction(normalizedTools, normalizedToolChoice, parallelToolCalls === true);
             messages.unshift({ role: 'system', content: toolInstruction });
 
             debugLog('responses.tools.instruction_built', {
                 requestId,
-                mode: hasStructuredOutputFormatterTool(normalizedTools)
+                mode: formatterToolName
                     ? 'langchain_structured_policy'
                     : 'default_tools_policy',
                 instructionChars: toolInstruction.length
@@ -1975,7 +1995,8 @@ app.post('/v1/responses', async (req, res) => {
         const responseId = createId('resp');
         const outputMessageId = createId('msg');
         const enableTools = normalizedTools.length > 0 && normalizedToolChoice.mode !== 'none';
-        const structuredParserMode = enableTools && hasStructuredOutputFormatterTool(normalizedTools);
+        const formatterToolName = getResponseFormatterToolName(normalizedTools);
+        const structuredParserMode = enableTools && Boolean(formatterToolName);
 
         debugLog('responses.tools.mode', {
             requestId,
@@ -2146,7 +2167,8 @@ app.post('/v1/responses', async (req, res) => {
                                 ? extractToolCallsFromText(completionText)
                                 : { toolCalls: [], malformed: false };
                             const toolCalls = extracted.toolCalls;
-                            const finalizerCalled = toolCalls.some((call) => call.name === FORMATTER_TOOL_NAME);
+                            const finalizerCalled = Boolean(formatterToolName)
+                                && toolCalls.some((call) => call.name === formatterToolName);
 
                             debugLog('responses.stream.tool_extraction', {
                                 requestId,
@@ -2405,7 +2427,7 @@ app.post('/v1/responses', async (req, res) => {
             return;
         }
 
-        const useEventStreamForNonStreaming = hasStructuredOutputFormatterTool(normalizedTools);
+        const useEventStreamForNonStreaming = Boolean(formatterToolName);
         let content = '';
         let reasoningContent = '';
         let extractedToolCalls = { toolCalls: [], malformed: false };
@@ -2495,7 +2517,8 @@ app.post('/v1/responses', async (req, res) => {
         }
 
         const toolCalls = extractedToolCalls.toolCalls;
-        const finalizerCalled = toolCalls.some((call) => call.name === FORMATTER_TOOL_NAME);
+        const finalizerCalled = Boolean(formatterToolName)
+            && toolCalls.some((call) => call.name === formatterToolName);
 
         debugLog('responses.non_stream.tool_extraction', {
             requestId,
