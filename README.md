@@ -135,6 +135,9 @@ LangChain compatibility notes:
 - `function_call_output` validation is strict (unknown `call_id` rejected; duplicate submissions are treated as idempotent no-ops); continuation can be resolved by `previous_response_id` or inferred by `call_id` for LangChain flows.
 - Built-in Responses tool types (`web_search`, `file_search`, `code_interpreter`) are explicitly rejected with `invalid_request_error`.
 - Current limitation: tool call detection still relies on constrained JSON extraction from model text output; malformed payloads fail explicitly with `invalid_response_error`.
+- Response formatter detection is prefix-based for function tool names via `RESPONSE_FORMATTER_TOOL_PREFIX` (default: `format_`).
+- When a formatter-prefixed tool is present, structured parser mode is enabled and policy instructions reference the exact matched tool name.
+- If multiple formatter-prefixed tools exist, the first match in request order is used as the formatter target.
 
 ---
 
