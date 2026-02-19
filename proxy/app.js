@@ -11,6 +11,10 @@ const RESPONSE_STATE_TTL_MS = 30 * 60 * 1000;
 const responseState = new Map();
 const UPSTREAM_TOOL_POLICY_TTL_MS = 60 * 1000;
 const LOG_LEVEL = (process.env.LOG_LEVEL || 'info').toLowerCase();
+const RESPONSES_OBJECT = 'response';
+const FORMATTER_TOOL_NAME = 'format_final_json_response';
+const ERROR_TYPE_INVALID_REQUEST = 'invalid_request_error';
+const ERROR_TYPE_INVALID_RESPONSE = 'invalid_response_error';
 let cachedUpstreamToolPolicy = {
     expiresAt: 0,
     tools: null
@@ -30,6 +34,10 @@ function debugLog(event, data = {}) {
     } catch (error) {
         console.log(`[DEBUG] ${event}`, data);
     }
+}
+
+function buildApiError(message, type) {
+    return { message, type };
 }
 
 function safeJsonLength(value) {
@@ -161,6 +169,16 @@ function summarizeResponsesPayload(payload) {
     }
 
     return summary;
+}
+
+function sendResponsesJson(res, payload, requestId, requestStartedAt) {
+    debugLog('responses.response_payload', {
+        requestId,
+        elapsedMs: Date.now() - requestStartedAt,
+        payload: summarizeResponsesPayload(payload)
+    });
+
+    return res.json(payload);
 }
 
 async function getDisabledUpstreamToolsPolicy(client, requestId) {
@@ -530,7 +548,7 @@ function normalizeTools(tools) {
 }
 
 function hasStructuredOutputFormatterTool(tools) {
-    return tools.some((tool) => tool.name === 'format_final_json_response');
+    return tools.some((tool) => tool.name === FORMATTER_TOOL_NAME);
 }
 
 function stripSystemReminderArtifacts(value) {
@@ -592,7 +610,7 @@ function buildToolSystemInstruction(tools, toolChoice, parallelToolCalls) {
     if (hasStructuredFormatter) {
         const formatterPolicy = toolChoice.mode === 'none'
             ? 'Do not call tools. Respond normally.'
-            : 'When producing the final answer, call tool "format_final_json_response" exactly once with the final structured payload. Do not output free-form text as final answer.';
+            : `When producing the final answer, call tool "${FORMATTER_TOOL_NAME}" exactly once with the final structured payload. Do not output free-form text as final answer.`;
 
         return [
             'TOOLS AVAILABLE:',
@@ -1158,7 +1176,7 @@ function resolveFunctionCallOutputTargets(functionCallOutputs, explicitPreviousR
             return {
                 error: {
                     message: 'function_call_output requires a valid previous_response_id',
-                    type: 'invalid_request_error'
+                    type: ERROR_TYPE_INVALID_REQUEST
                 }
             };
         }
@@ -1198,7 +1216,7 @@ function resolveFunctionCallOutputTargets(functionCallOutputs, explicitPreviousR
             return {
                 error: {
                     message: `Unknown function_call_output call_id: ${outputItem.call_id}`,
-                    type: 'invalid_request_error'
+                    type: ERROR_TYPE_INVALID_REQUEST
                 }
             };
         }
@@ -1207,7 +1225,7 @@ function resolveFunctionCallOutputTargets(functionCallOutputs, explicitPreviousR
             return {
                 error: {
                     message: `Ambiguous function_call_output call_id: ${outputItem.call_id}`,
-                    type: 'invalid_request_error'
+                    type: ERROR_TYPE_INVALID_REQUEST
                 }
             };
         }
@@ -1218,7 +1236,7 @@ function resolveFunctionCallOutputTargets(functionCallOutputs, explicitPreviousR
             return {
                 error: {
                     message: 'Invalid or expired previous_response_id inferred from function_call_output',
-                    type: 'invalid_request_error'
+                    type: ERROR_TYPE_INVALID_REQUEST
                 }
             };
         }
@@ -1234,7 +1252,7 @@ function resolveFunctionCallOutputTargets(functionCallOutputs, explicitPreviousR
         return {
             error: {
                 message: 'function_call_output items must target a single continuation context',
-                type: 'invalid_request_error'
+                type: ERROR_TYPE_INVALID_REQUEST
             }
         };
     }
@@ -1265,7 +1283,7 @@ function validateFunctionCallOutputs(functionCallOutputs, ownershipByCallId) {
             return {
                 error: {
                     message: `Duplicate function_call_output call_id in request: ${outputItem.call_id}`,
-                    type: 'invalid_request_error'
+                    type: ERROR_TYPE_INVALID_REQUEST
                 }
             };
         }
@@ -1276,7 +1294,7 @@ function validateFunctionCallOutputs(functionCallOutputs, ownershipByCallId) {
             return {
                 error: {
                     message: `Unknown function_call_output call_id: ${outputItem.call_id}`,
-                    type: 'invalid_request_error'
+                    type: ERROR_TYPE_INVALID_REQUEST
                 }
             };
         }
@@ -1727,10 +1745,7 @@ app.post('/v1/responses', async (req, res) => {
                 error: normalizedToolsResult.error
             });
             return res.status(400).json({
-                error: {
-                    message: normalizedToolsResult.error,
-                    type: 'invalid_request_error'
-                }
+                error: buildApiError(normalizedToolsResult.error, ERROR_TYPE_INVALID_REQUEST)
             });
         }
 
@@ -1747,19 +1762,13 @@ app.post('/v1/responses', async (req, res) => {
                 reason: normalizedToolChoice.reason
             });
             return res.status(400).json({
-                error: {
-                    message: normalizedToolChoice.reason,
-                    type: 'invalid_request_error'
-                }
+                error: buildApiError(normalizedToolChoice.reason, ERROR_TYPE_INVALID_REQUEST)
             });
         }
 
         if (normalizedToolChoice.mode === 'required' && normalizedTools.length === 0) {
             return res.status(400).json({
-                error: {
-                    message: 'tool_choice=required requires at least one function tool',
-                    type: 'invalid_request_error'
-                }
+                error: buildApiError('tool_choice=required requires at least one function tool', ERROR_TYPE_INVALID_REQUEST)
             });
         }
 
@@ -1769,7 +1778,7 @@ app.post('/v1/responses', async (req, res) => {
                 return res.status(400).json({
                     error: {
                         message: `tool_choice requires unknown function: ${normalizedToolChoice.name}`,
-                        type: 'invalid_request_error'
+                        type: ERROR_TYPE_INVALID_REQUEST
                     }
                 });
             }
@@ -1784,7 +1793,7 @@ app.post('/v1/responses', async (req, res) => {
                 return res.status(400).json({
                     error: {
                         message: 'Invalid or expired previous_response_id',
-                        type: 'invalid_request_error'
+                        type: ERROR_TYPE_INVALID_REQUEST
                     }
                 });
             }
@@ -1915,7 +1924,7 @@ app.post('/v1/responses', async (req, res) => {
 
                 const payload = {
                     id: responseId,
-                    object: 'response',
+                    object: RESPONSES_OBJECT,
                     created_at: createdAt,
                     status: 'completed',
                     model: `${providerId}/${modelId}`,
@@ -1937,19 +1946,13 @@ app.post('/v1/responses', async (req, res) => {
                     error: null
                 };
 
-                debugLog('responses.response_payload', {
-                    requestId,
-                    elapsedMs: Date.now() - requestStartedAt,
-                    payload: summarizeResponsesPayload(payload)
-                });
-
-                return res.json(payload);
+                return sendResponsesJson(res, payload, requestId, requestStartedAt);
             }
 
             return res.status(400).json({
                 error: {
                     message: 'input is required when no usable previous_response_id context is provided',
-                    type: 'invalid_request_error'
+                    type: ERROR_TYPE_INVALID_REQUEST
                 }
             });
         }
@@ -1995,7 +1998,7 @@ app.post('/v1/responses', async (req, res) => {
                 type: 'response.created',
                 response: {
                     id: responseId,
-                    object: 'response',
+                    object: RESPONSES_OBJECT,
                     created_at: createdAt,
                     status: 'in_progress',
                     model: `${providerId}/${modelId}`
@@ -2143,7 +2146,7 @@ app.post('/v1/responses', async (req, res) => {
                                 ? extractToolCallsFromText(completionText)
                                 : { toolCalls: [], malformed: false };
                             const toolCalls = extracted.toolCalls;
-                            const finalizerCalled = toolCalls.some((call) => call.name === 'format_final_json_response');
+                            const finalizerCalled = toolCalls.some((call) => call.name === FORMATTER_TOOL_NAME);
 
                             debugLog('responses.stream.tool_extraction', {
                                 requestId,
@@ -2158,7 +2161,7 @@ app.post('/v1/responses', async (req, res) => {
                                     type: 'error',
                                     error: {
                                         message: 'Malformed tool call payload from model output',
-                                        type: 'invalid_response_error'
+                                        type: ERROR_TYPE_INVALID_RESPONSE
                                     }
                                 });
                                 res.end();
@@ -2171,7 +2174,7 @@ app.post('/v1/responses', async (req, res) => {
                                     type: 'error',
                                     error: {
                                         message: 'Model did not produce required function call output',
-                                        type: 'invalid_response_error'
+                                        type: ERROR_TYPE_INVALID_RESPONSE
                                     }
                                 });
                                 res.end();
@@ -2184,7 +2187,7 @@ app.post('/v1/responses', async (req, res) => {
                                     type: 'error',
                                     error: {
                                         message: 'Structured parser mode requires at least one function call output',
-                                        type: 'invalid_response_error'
+                                        type: ERROR_TYPE_INVALID_RESPONSE
                                     }
                                 });
                                 res.end();
@@ -2197,7 +2200,7 @@ app.post('/v1/responses', async (req, res) => {
                                     type: 'error',
                                     error: {
                                         message: 'Model returned multiple tool calls while parallel_tool_calls is false',
-                                        type: 'invalid_response_error'
+                                        type: ERROR_TYPE_INVALID_RESPONSE
                                     }
                                 });
                                 res.end();
@@ -2214,7 +2217,7 @@ app.post('/v1/responses', async (req, res) => {
                                             type: 'error',
                                             error: {
                                                 message: `Model attempted unknown tool: ${toolCall.name}`,
-                                                type: 'invalid_response_error'
+                                                type: ERROR_TYPE_INVALID_RESPONSE
                                             }
                                         });
                                         res.end();
@@ -2235,7 +2238,7 @@ app.post('/v1/responses', async (req, res) => {
                                             type: 'error',
                                             error: {
                                                 message: `Model did not call required function: ${normalizedToolChoice.name}`,
-                                                type: 'invalid_response_error'
+                                                type: ERROR_TYPE_INVALID_RESPONSE
                                             }
                                         });
                                         res.end();
@@ -2290,7 +2293,7 @@ app.post('/v1/responses', async (req, res) => {
                                     type: 'response.completed',
                                     response: {
                                         id: responseId,
-                                        object: 'response',
+                                        object: RESPONSES_OBJECT,
                                         created_at: createdAt,
                                         status: 'completed',
                                         model: `${providerId}/${modelId}`,
@@ -2343,7 +2346,7 @@ app.post('/v1/responses', async (req, res) => {
                                 type: 'response.completed',
                                 response: {
                                     id: responseId,
-                                    object: 'response',
+                                    object: RESPONSES_OBJECT,
                                     created_at: createdAt,
                                     status: 'completed',
                                     model: `${providerId}/${modelId}`,
@@ -2492,7 +2495,7 @@ app.post('/v1/responses', async (req, res) => {
         }
 
         const toolCalls = extractedToolCalls.toolCalls;
-        const finalizerCalled = toolCalls.some((call) => call.name === 'format_final_json_response');
+        const finalizerCalled = toolCalls.some((call) => call.name === FORMATTER_TOOL_NAME);
 
         debugLog('responses.non_stream.tool_extraction', {
             requestId,
@@ -2507,7 +2510,7 @@ app.post('/v1/responses', async (req, res) => {
             return res.status(500).json({
                 error: {
                     message: 'Malformed tool call payload from model output',
-                    type: 'invalid_response_error'
+                    type: ERROR_TYPE_INVALID_RESPONSE
                 }
             });
         }
@@ -2516,7 +2519,7 @@ app.post('/v1/responses', async (req, res) => {
             return res.status(500).json({
                 error: {
                     message: 'Model did not produce required function call output',
-                    type: 'invalid_response_error'
+                    type: ERROR_TYPE_INVALID_RESPONSE
                 }
             });
         }
@@ -2525,7 +2528,7 @@ app.post('/v1/responses', async (req, res) => {
             return res.status(500).json({
                 error: {
                     message: 'Structured parser mode requires at least one function call output',
-                    type: 'invalid_response_error'
+                    type: ERROR_TYPE_INVALID_RESPONSE
                 }
             });
         }
@@ -2534,7 +2537,7 @@ app.post('/v1/responses', async (req, res) => {
             return res.status(500).json({
                 error: {
                     message: 'Model returned multiple tool calls while parallel_tool_calls is false',
-                    type: 'invalid_response_error'
+                    type: ERROR_TYPE_INVALID_RESPONSE
                 }
             });
         }
@@ -2546,7 +2549,7 @@ app.post('/v1/responses', async (req, res) => {
                     return res.status(400).json({
                         error: {
                             message: `Model attempted unknown tool: ${toolCall.name}`,
-                            type: 'invalid_response_error'
+                            type: ERROR_TYPE_INVALID_RESPONSE
                         }
                     });
                 }
@@ -2558,7 +2561,7 @@ app.post('/v1/responses', async (req, res) => {
                     return res.status(500).json({
                         error: {
                             message: `Model did not call required function: ${normalizedToolChoice.name}`,
-                            type: 'invalid_response_error'
+                            type: ERROR_TYPE_INVALID_RESPONSE
                         }
                     });
                 }
@@ -2580,7 +2583,7 @@ app.post('/v1/responses', async (req, res) => {
 
             const payload = {
                 id: responseId,
-                object: 'response',
+                object: RESPONSES_OBJECT,
                 created_at: createdAt,
                 status: 'completed',
                 model: `${providerId}/${modelId}`,
@@ -2590,13 +2593,7 @@ app.post('/v1/responses', async (req, res) => {
                 error: null
             };
 
-            debugLog('responses.response_payload', {
-                requestId,
-                elapsedMs: Date.now() - requestStartedAt,
-                payload: summarizeResponsesPayload(payload)
-            });
-
-            return res.json(payload);
+            return sendResponsesJson(res, payload, requestId, requestStartedAt);
         }
 
         storeResponseState(responseId, {
@@ -2607,7 +2604,7 @@ app.post('/v1/responses', async (req, res) => {
 
         const payload = {
             id: responseId,
-            object: 'response',
+            object: RESPONSES_OBJECT,
             created_at: createdAt,
             status: 'completed',
             model: `${providerId}/${modelId}`,
@@ -2624,13 +2621,7 @@ app.post('/v1/responses', async (req, res) => {
             error: null
         };
 
-        debugLog('responses.response_payload', {
-            requestId,
-            elapsedMs: Date.now() - requestStartedAt,
-            payload: summarizeResponsesPayload(payload)
-        });
-
-        return res.json(payload);
+        return sendResponsesJson(res, payload, requestId, requestStartedAt);
     } catch (error) {
         console.error('Responses API Proxy Error:', error);
         debugLog('responses.request.error', {
