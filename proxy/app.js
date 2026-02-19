@@ -2,12 +2,244 @@ import express from 'express';
 import bodyParser from 'body-parser';
 import cors from 'cors';
 import axios from 'axios';
+import { randomUUID } from 'node:crypto';
 import { createOpencodeClient } from '@opencode-ai/sdk';
 
 const app = express();
 const TARGET_PORT = 4097;
 const RESPONSE_STATE_TTL_MS = 30 * 60 * 1000;
 const responseState = new Map();
+const UPSTREAM_TOOL_POLICY_TTL_MS = 60 * 1000;
+const LOG_LEVEL = (process.env.LOG_LEVEL || 'info').toLowerCase();
+const RESPONSES_OBJECT = 'response';
+const DEFAULT_RESPONSE_FORMATTER_TOOL_NAME = 'format_';
+const RESPONSE_FORMATTER_TOOL_NAME = (() => {
+    const configured = process.env.RESPONSE_FORMATTER_TOOL_PREFIX;
+    if (typeof configured !== 'string' || configured.trim().length === 0) {
+        return DEFAULT_RESPONSE_FORMATTER_TOOL_NAME;
+    }
+    return configured.trim();
+})();
+const ERROR_TYPE_INVALID_REQUEST = 'invalid_request_error';
+const ERROR_TYPE_INVALID_RESPONSE = 'invalid_response_error';
+let cachedUpstreamToolPolicy = {
+    expiresAt: 0,
+    tools: null
+};
+
+function isDebugLoggingEnabled() {
+    return LOG_LEVEL === 'debug';
+}
+
+function debugLog(event, data = {}) {
+    if (!isDebugLoggingEnabled()) {
+        return;
+    }
+
+    try {
+        console.log(`[DEBUG] ${event}`, JSON.stringify(data));
+    } catch (error) {
+        console.log(`[DEBUG] ${event}`, data);
+    }
+}
+
+function buildApiError(message, type) {
+    return { message, type };
+}
+
+function safeJsonLength(value) {
+    try {
+        return JSON.stringify(value).length;
+    } catch (error) {
+        return -1;
+    }
+}
+
+function estimateSchemaDepth(value, depth = 0) {
+    if (!value || typeof value !== 'object') {
+        return depth;
+    }
+
+    let maxDepth = depth;
+    for (const nested of Object.values(value)) {
+        const nestedDepth = estimateSchemaDepth(nested, depth + 1);
+        if (nestedDepth > maxDepth) {
+            maxDepth = nestedDepth;
+        }
+    }
+
+    return maxDepth;
+}
+
+function summarizeTools(tools) {
+    if (!Array.isArray(tools)) {
+        return {
+            provided: tools !== undefined,
+            isArray: false,
+            count: 0
+        };
+    }
+
+    return {
+        provided: true,
+        isArray: true,
+        count: tools.length,
+        items: tools.map((tool, index) => {
+            const functionDef = tool?.function && typeof tool.function === 'object' ? tool.function : tool;
+            const schema = functionDef?.parameters || functionDef?.input_schema;
+            return {
+                index,
+                type: tool?.type,
+                name: functionDef?.name || null,
+                hasDescription: Boolean(functionDef?.description),
+                schemaBytes: safeJsonLength(schema),
+                schemaDepth: estimateSchemaDepth(schema)
+            };
+        })
+    };
+}
+
+function summarizeResponsesInput(input) {
+    if (typeof input === 'string') {
+        return { kind: 'string', length: input.length };
+    }
+
+    if (!Array.isArray(input)) {
+        return { kind: typeof input };
+    }
+
+    const typeCounts = {};
+    const roleCounts = {};
+    for (const item of input) {
+        const itemType = typeof item === 'string'
+            ? 'string'
+            : item?.type || (item?.role ? 'role_item' : typeof item);
+        typeCounts[itemType] = (typeCounts[itemType] || 0) + 1;
+
+        if (item?.role) {
+            roleCounts[item.role] = (roleCounts[item.role] || 0) + 1;
+        }
+    }
+
+    return {
+        kind: 'array',
+        count: input.length,
+        typeCounts,
+        roleCounts
+    };
+}
+
+function getErrorDetails(error) {
+    return {
+        name: error?.name,
+        message: error?.message,
+        code: error?.code,
+        cause: error?.cause
+            ? {
+                name: error.cause.name,
+                message: error.cause.message,
+                code: error.cause.code
+            }
+            : null
+    };
+}
+
+function summarizeResponsesPayload(payload) {
+    const output = Array.isArray(payload?.output) ? payload.output : [];
+    const firstOutput = output[0] || null;
+
+    const summary = {
+        id: payload?.id,
+        status: payload?.status,
+        outputCount: output.length,
+        firstOutputType: firstOutput?.type || null,
+        firstOutputName: firstOutput?.name || null,
+        firstOutputCallId: firstOutput?.call_id || null,
+        firstOutputId: firstOutput?.id || null,
+        hasOutputText: typeof payload?.output_text === 'string',
+        outputTextPreview: typeof payload?.output_text === 'string'
+            ? payload.output_text.slice(0, 220)
+            : null
+    };
+
+    if (firstOutput?.type === 'function_call') {
+        summary.firstOutputArgumentsPreview = typeof firstOutput.arguments === 'string'
+            ? firstOutput.arguments.slice(0, 320)
+            : null;
+    }
+
+    if (firstOutput?.type === 'message') {
+        const text = firstOutput?.content?.find((part) => part?.type === 'output_text')?.text;
+        summary.firstMessageTextPreview = typeof text === 'string'
+            ? text.slice(0, 220)
+            : null;
+    }
+
+    return summary;
+}
+
+function sendResponsesJson(res, payload, requestId, requestStartedAt) {
+    debugLog('responses.response_payload', {
+        requestId,
+        elapsedMs: Date.now() - requestStartedAt,
+        payload: summarizeResponsesPayload(payload)
+    });
+
+    return res.json(payload);
+}
+
+async function getDisabledUpstreamToolsPolicy(client, requestId) {
+    if (cachedUpstreamToolPolicy.tools && cachedUpstreamToolPolicy.expiresAt > Date.now()) {
+        debugLog('responses.upstream.tools_disabled', {
+            requestId,
+            source: 'cache',
+            disabledCount: Object.keys(cachedUpstreamToolPolicy.tools).length,
+            sample: Object.keys(cachedUpstreamToolPolicy.tools).slice(0, 8)
+        });
+        return cachedUpstreamToolPolicy.tools;
+    }
+
+    let toolIdsRes;
+    try {
+        toolIdsRes = await client.tool.ids();
+    } catch (error) {
+        throw new Error(`Unable to fetch upstream tool IDs: ${error.message || 'unknown error'}`);
+    }
+
+    const rawData = toolIdsRes?.data;
+    const toolIds = Array.isArray(rawData)
+        ? rawData
+        : Array.isArray(rawData?.toolIds)
+            ? rawData.toolIds
+            : Array.isArray(rawData?.tools)
+                ? rawData.tools
+                : null;
+
+    if (!Array.isArray(toolIds)) {
+        throw new Error('Unable to fetch upstream tool IDs: unexpected response shape');
+    }
+
+    const toolsPolicy = {};
+    for (const toolId of toolIds) {
+        if (typeof toolId === 'string' && toolId.trim()) {
+            toolsPolicy[toolId] = false;
+        }
+    }
+
+    cachedUpstreamToolPolicy = {
+        expiresAt: Date.now() + UPSTREAM_TOOL_POLICY_TTL_MS,
+        tools: toolsPolicy
+    };
+
+    debugLog('responses.upstream.tools_disabled', {
+        requestId,
+        source: 'network',
+        disabledCount: Object.keys(toolsPolicy).length,
+        sample: Object.keys(toolsPolicy).slice(0, 8)
+    });
+
+    return toolsPolicy;
+}
 
 app.use(cors());
 app.use(bodyParser.json({ limit: '50mb' }));
@@ -242,6 +474,879 @@ function buildResponsesUsage(promptText, content, reasoningContent) {
 
 function sendResponseSseEvent(res, payload) {
     res.write(`data: ${JSON.stringify(payload)}\n\n`);
+}
+
+function createId(prefix) {
+    return `${prefix}_${randomUUID().replace(/-/g, '')}`;
+}
+
+function normalizeToolChoice(toolChoice) {
+    if (toolChoice === undefined || toolChoice === null) {
+        return { mode: 'auto' };
+    }
+
+    if (typeof toolChoice === 'string') {
+        if (toolChoice === 'auto' || toolChoice === 'none' || toolChoice === 'required') {
+            return { mode: toolChoice };
+        }
+        return { mode: 'invalid', reason: 'Invalid tool_choice string value' };
+    }
+
+    if (toolChoice.type === 'function' && toolChoice.function?.name) {
+        return { mode: 'required', name: toolChoice.function.name };
+    }
+
+    return { mode: 'invalid', reason: 'Invalid tool_choice object value' };
+}
+
+function normalizeTools(tools) {
+    if (tools === undefined || tools === null) {
+        return { tools: [] };
+    }
+
+    if (!Array.isArray(tools)) {
+        return {
+            tools: [],
+            error: 'tools must be an array when provided'
+        };
+    }
+
+    const normalized = [];
+    for (const tool of tools) {
+        if (!tool || typeof tool !== 'object') {
+            continue;
+        }
+
+        if (tool.type === 'function') {
+            const functionDef = tool.function && typeof tool.function === 'object'
+                ? tool.function
+                : tool;
+            const functionName = typeof functionDef.name === 'string' ? functionDef.name.trim() : '';
+
+            if (!functionName) {
+                return {
+                    tools: [],
+                    error: 'Function tools must include a name'
+                };
+            }
+
+            normalized.push({
+                name: functionName,
+                description: functionDef.description || '',
+                parameters: functionDef.parameters || functionDef.input_schema || { type: 'object', properties: {} }
+            });
+            continue;
+        }
+
+        if (tool.type === 'web_search' || tool.type === 'file_search' || tool.type === 'code_interpreter') {
+            return {
+                tools: [],
+                error: `Unsupported built-in tool type: ${tool.type}`
+            };
+        }
+
+        return {
+            tools: [],
+            error: `Unsupported tool type: ${tool.type || 'unknown'}`
+        };
+    }
+
+    return { tools: normalized };
+}
+
+function getResponseFormatterToolName(tools) {
+    const normalizedPrefix = RESPONSE_FORMATTER_TOOL_NAME.toLowerCase();
+    for (const tool of tools) {
+        if (typeof tool?.name !== 'string') {
+            continue;
+        }
+
+        if (tool.name.toLowerCase().startsWith(normalizedPrefix)) {
+            return tool.name;
+        }
+    }
+
+    return null;
+}
+
+function stripSystemReminderArtifacts(value) {
+    if (typeof value !== 'string') {
+        return value;
+    }
+
+    const reminderTag = '<system-reminder>';
+    const reminderIndex = value.indexOf(reminderTag);
+    if (reminderIndex === -1) {
+        return value;
+    }
+
+    return value.slice(0, reminderIndex).trimEnd();
+}
+
+function sanitizeToolArgumentsValue(value) {
+    if (typeof value === 'string') {
+        return stripSystemReminderArtifacts(value);
+    }
+
+    if (Array.isArray(value)) {
+        return value.map((item) => sanitizeToolArgumentsValue(item));
+    }
+
+    if (value && typeof value === 'object') {
+        const out = {};
+        for (const [key, nested] of Object.entries(value)) {
+            out[key] = sanitizeToolArgumentsValue(nested);
+        }
+        return out;
+    }
+
+    return value;
+}
+
+function buildToolSystemInstruction(tools, toolChoice, parallelToolCalls) {
+    if (!tools.length) {
+        return '';
+    }
+
+    const formatterToolName = getResponseFormatterToolName(tools);
+    const hasStructuredFormatter = Boolean(formatterToolName);
+    const toolList = tools.map((tool) => {
+        const schema = tool.parameters || {};
+        return `- ${tool.name}: ${tool.description || 'No description'}; parameters schema: ${JSON.stringify(schema)}`;
+    }).join('\n');
+
+    let policy = 'Use tools only when needed.';
+    if (toolChoice.mode === 'none') {
+        policy = 'Do not call tools. Respond normally.';
+    } else if (toolChoice.mode === 'required' && toolChoice.name) {
+        policy = `You must call tool \"${toolChoice.name}\".`;
+    } else if (toolChoice.mode === 'required') {
+        policy = 'You must call at least one tool.';
+    }
+
+    const parallelPolicy = parallelToolCalls ? 'Parallel calls are allowed.' : 'Return at most one tool call.';
+
+    if (hasStructuredFormatter) {
+        const formatterPolicy = toolChoice.mode === 'none'
+            ? 'Do not call tools. Respond normally.'
+            : `When producing the final answer, call tool "${formatterToolName}" exactly once with the final structured payload. Do not output free-form text as final answer.`;
+
+        return [
+            'TOOLS AVAILABLE:',
+            toolList,
+            policy,
+            parallelPolicy,
+            formatterPolicy,
+            'If you call tools, respond with ONLY valid JSON in this shape:',
+            '{"tool_calls":[{"name":"tool_name","arguments":{}}]}',
+            'Do not include markdown, prose, or system-reminder content in tool arguments values.'
+        ].join('\n');
+    }
+
+    return [
+        'TOOLS AVAILABLE:',
+        toolList,
+        policy,
+        parallelPolicy,
+        'If you decide to call a tool, respond with ONLY valid JSON in exactly this shape:',
+        '{"tool_calls":[{"name":"tool_name","arguments":{}}]}',
+        'If no tool call is needed, respond with normal assistant text.'
+    ].join('\n');
+}
+
+async function collectResponseViaEventStream({
+    client,
+    sessionId,
+    providerId,
+    modelId,
+    fullPromptText,
+    systemPrompt,
+    allParts,
+    upstreamToolsPolicy,
+    requestId,
+    requestStartedAt
+}) {
+    const eventStreamResult = await client.event.subscribe();
+    const eventStream = eventStreamResult.stream;
+
+    let completionText = '';
+    let reasoningText = '';
+    let insideReasoning = false;
+    let completed = false;
+    let promptError = null;
+    const eventTypeCounts = {};
+    const messagePartTypeCounts = {};
+    const structuredToolCallBuffers = new Map();
+    let structuredToolCallMalformed = false;
+    const partTextCursor = new Map();
+    let textFromDeltaChars = 0;
+    let textFromPartChars = 0;
+    let reasoningFromDeltaChars = 0;
+    let reasoningFromPartChars = 0;
+
+    const getSessionIdFromPart = (part, event) => {
+        return part?.sessionID
+            || part?.sessionId
+            || event?.properties?.sessionID
+            || event?.properties?.sessionId
+            || event?.properties?.info?.sessionID
+            || null;
+    };
+
+    const getPartName = (part, delta) => {
+        return part?.name
+            || part?.function?.name
+            || part?.tool?.name
+            || delta?.name
+            || delta?.function?.name
+            || delta?.tool?.name
+            || null;
+    };
+
+    const getPartCallId = (part, delta) => {
+        return part?.call_id
+            || part?.callID
+            || part?.tool_call_id
+            || part?.id
+            || delta?.call_id
+            || delta?.callID
+            || delta?.tool_call_id
+            || null;
+    };
+
+    const pushStructuredToolCallUpdate = ({ callId, name, argumentsChunk, argumentsObject }) => {
+        if (!name || typeof name !== 'string') {
+            return;
+        }
+
+        const key = callId || name;
+        const current = structuredToolCallBuffers.get(key) || {
+            call_id: callId || createId('call'),
+            name,
+            argumentChunks: [],
+            argumentObject: null
+        };
+
+        current.call_id = callId || current.call_id;
+        current.name = name || current.name;
+
+        if (typeof argumentsChunk === 'string' && argumentsChunk.length > 0) {
+            current.argumentChunks.push(argumentsChunk);
+        }
+
+        if (argumentsObject && typeof argumentsObject === 'object' && !Array.isArray(argumentsObject)) {
+            current.argumentObject = argumentsObject;
+        }
+
+        structuredToolCallBuffers.set(key, current);
+    };
+
+    const maybeCaptureStructuredToolCall = (part, delta) => {
+        const partType = part?.type;
+        if (partType !== 'function_call' && partType !== 'tool_call' && partType !== 'tool') {
+            return;
+        }
+
+        const name = getPartName(part, delta);
+        const callId = getPartCallId(part, delta);
+
+        if (typeof delta === 'string' && delta.length > 0) {
+            pushStructuredToolCallUpdate({
+                callId,
+                name,
+                argumentsChunk: delta
+            });
+            return;
+        }
+
+        const argsFromPart = part?.arguments
+            || part?.function?.arguments
+            || part?.tool?.arguments
+            || part?.input
+            || delta?.arguments
+            || delta?.function?.arguments
+            || delta?.tool?.arguments
+            || delta?.input
+            || delta?.input_json
+            || delta?.json
+            || delta?.partial_json
+            || null;
+        if (typeof argsFromPart === 'string') {
+            pushStructuredToolCallUpdate({
+                callId,
+                name,
+                argumentsChunk: argsFromPart
+            });
+            return;
+        }
+
+        if (argsFromPart && typeof argsFromPart === 'object' && !Array.isArray(argsFromPart)) {
+            pushStructuredToolCallUpdate({
+                callId,
+                name,
+                argumentsObject: argsFromPart
+            });
+        }
+    };
+
+    const processMessagePartEvent = (event, part, delta) => {
+        const partSessionId = getSessionIdFromPart(part, event);
+        if (partSessionId !== sessionId) {
+            return;
+        }
+
+        const partType = part?.type || 'unknown';
+        messagePartTypeCounts[partType] = (messagePartTypeCounts[partType] || 0) + 1;
+
+        maybeCaptureStructuredToolCall(part, delta);
+
+        const partKey = part?.id
+            || `${partType}:${part?.messageID || event?.properties?.messageID || ''}:${partSessionId || ''}`;
+
+        const resolvePartTextDelta = () => {
+            if (typeof delta === 'string' && delta.length > 0) {
+                return { text: delta, source: 'delta' };
+            }
+
+            if (typeof part?.text === 'string') {
+                const previousLength = partTextCursor.get(partKey) || 0;
+                const currentLength = part.text.length;
+                const suffix = currentLength > previousLength
+                    ? part.text.slice(previousLength)
+                    : '';
+                partTextCursor.set(partKey, currentLength);
+                return { text: suffix, source: 'part' };
+            }
+
+            if (delta && typeof delta === 'object' && typeof delta.text === 'string' && delta.text.length > 0) {
+                return { text: delta.text, source: 'delta' };
+            }
+
+            return { text: '', source: 'none' };
+        };
+
+        if (partType === 'reasoning') {
+            const { text: deltaText, source } = resolvePartTextDelta();
+            if (!deltaText) {
+                return;
+            }
+            if (!insideReasoning) {
+                reasoningText += '<think>\n';
+                insideReasoning = true;
+            }
+            reasoningText += deltaText;
+            if (source === 'delta') {
+                reasoningFromDeltaChars += deltaText.length;
+            }
+            if (source === 'part') {
+                reasoningFromPartChars += deltaText.length;
+            }
+            return;
+        }
+
+        if (partType === 'text') {
+            const { text: deltaText, source } = resolvePartTextDelta();
+            if (!deltaText) {
+                return;
+            }
+            if (insideReasoning) {
+                reasoningText += '\n</think>\n\n';
+                insideReasoning = false;
+            }
+            completionText += deltaText;
+            if (source === 'delta') {
+                textFromDeltaChars += deltaText.length;
+            }
+            if (source === 'part') {
+                textFromPartChars += deltaText.length;
+            }
+        }
+    };
+
+    debugLog('responses.non_stream_via_events.subscribe_ready', {
+        requestId,
+        elapsedMs: Date.now() - requestStartedAt,
+        sessionId
+    });
+
+    client.session.prompt({
+        path: { id: sessionId },
+        body: {
+            model: {
+                providerID: providerId,
+                modelID: modelId
+            },
+            prompt: fullPromptText,
+            system: systemPrompt,
+            tools: upstreamToolsPolicy,
+            parts: allParts
+        }
+    }).catch((error) => {
+        promptError = error;
+        debugLog('responses.non_stream_via_events.prompt_error', {
+            requestId,
+            elapsedMs: Date.now() - requestStartedAt,
+            error: getErrorDetails(error)
+        });
+    });
+
+    for await (const event of eventStream) {
+        if (promptError) {
+            throw promptError;
+        }
+
+        eventTypeCounts[event.type] = (eventTypeCounts[event.type] || 0) + 1;
+
+        if (event.type === 'message.part.updated' || event.type === 'message.part.delta') {
+            const { part, delta } = event.properties || {};
+            if (!part) {
+                continue;
+            }
+
+            processMessagePartEvent(event, part, delta);
+        }
+
+        if (event.type === 'message.updated') {
+            const messageInfo = event.properties?.info;
+            const messageParts = Array.isArray(event.properties?.message?.parts)
+                ? event.properties.message.parts
+                : [];
+            for (const messagePart of messageParts) {
+                processMessagePartEvent(event, messagePart, null);
+            }
+
+            if (messageInfo?.sessionID === sessionId && messageInfo?.finish === 'stop') {
+                if (insideReasoning) {
+                    reasoningText += '\n</think>\n\n';
+                }
+                completed = true;
+                break;
+            }
+        }
+    }
+
+    const structuredToolCalls = [];
+    for (const candidate of structuredToolCallBuffers.values()) {
+        const argumentsString = candidate.argumentObject
+            ? JSON.stringify(candidate.argumentObject)
+            : candidate.argumentChunks.join('');
+        const fallbackArguments = argumentsString && argumentsString.trim().length > 0
+            ? argumentsString
+            : '{}';
+
+        let parsedArguments;
+        try {
+            parsedArguments = JSON.parse(fallbackArguments);
+        } catch (error) {
+            structuredToolCallMalformed = true;
+            continue;
+        }
+
+        if (!parsedArguments || typeof parsedArguments !== 'object' || Array.isArray(parsedArguments)) {
+            structuredToolCallMalformed = true;
+            continue;
+        }
+
+        structuredToolCalls.push({
+            call_id: candidate.call_id || createId('call'),
+            name: candidate.name,
+            arguments: JSON.stringify(parsedArguments)
+        });
+    }
+
+    debugLog('responses.non_stream_via_events.summary', {
+        requestId,
+        elapsedMs: Date.now() - requestStartedAt,
+        eventTypeCounts,
+        messagePartTypeCounts,
+        completionChars: completionText.length,
+        reasoningChars: reasoningText.length,
+        textFromDeltaChars,
+        textFromPartChars,
+        reasoningFromDeltaChars,
+        reasoningFromPartChars,
+        structuredToolCallCount: structuredToolCalls.length,
+        structuredToolCallMalformed
+    });
+
+    if (!completed) {
+        if (promptError) {
+            throw promptError;
+        }
+        throw new Error('Responses event stream ended before completion');
+    }
+
+    return {
+        completionText,
+        reasoningText,
+        structuredToolCalls,
+        structuredToolCallMalformed
+    };
+}
+
+function extractToolCallsFromText(text) {
+    if (!text || typeof text !== 'string') {
+        return { toolCalls: [], malformed: false };
+    }
+
+    const normalizeParsedToolCalls = (parsed) => {
+        const objectPayload = Array.isArray(parsed)
+            ? parsed.find((item) => item && typeof item === 'object' && (Object.prototype.hasOwnProperty.call(item, 'tool_calls') || Object.prototype.hasOwnProperty.call(item, 'tool_call')))
+            : parsed;
+
+        const hasToolCallField = Object.prototype.hasOwnProperty.call(objectPayload || {}, 'tool_calls')
+            || Object.prototype.hasOwnProperty.call(objectPayload || {}, 'tool_call');
+
+        const rawCalls = Array.isArray(objectPayload?.tool_calls)
+            ? objectPayload.tool_calls
+            : objectPayload?.tool_call
+                ? [objectPayload.tool_call]
+                : [];
+
+        if (hasToolCallField && !rawCalls.length) {
+            return { toolCalls: [], malformed: true };
+        }
+
+        if (!rawCalls.length) {
+            return { toolCalls: [], malformed: false };
+        }
+
+        const normalized = [];
+        for (const call of rawCalls) {
+            const callName = call?.name || call?.function?.name;
+            if (!call || typeof call !== 'object' || typeof callName !== 'string' || !callName.trim()) {
+                return { toolCalls: [], malformed: true };
+            }
+
+            let argsObj = call.arguments ?? call.function?.arguments ?? call.input ?? {};
+            if (typeof argsObj === 'string') {
+                const normalizedArgsString = argsObj.trim();
+                try {
+                    argsObj = normalizedArgsString.length > 0 ? JSON.parse(normalizedArgsString) : {};
+                } catch (error) {
+                    return { toolCalls: [], malformed: true };
+                }
+            }
+
+            if (!argsObj || typeof argsObj !== 'object' || Array.isArray(argsObj)) {
+                return { toolCalls: [], malformed: true };
+            }
+
+            argsObj = sanitizeToolArgumentsValue(argsObj);
+
+            normalized.push({
+                call_id: typeof call.call_id === 'string' && call.call_id.trim()
+                    ? call.call_id
+                    : (typeof call.id === 'string' && call.id.trim() ? call.id : createId('call')),
+                name: callName,
+                arguments: JSON.stringify(argsObj)
+            });
+        }
+
+        return { toolCalls: normalized, malformed: false };
+    };
+
+    const extractObjectSnippetsAroundKeyword = (sourceText, keyword) => {
+        const snippets = [];
+        let searchFrom = 0;
+
+        while (searchFrom < sourceText.length && snippets.length < 12) {
+            const keywordIndex = sourceText.indexOf(keyword, searchFrom);
+            if (keywordIndex === -1) {
+                break;
+            }
+
+            let start = keywordIndex;
+            while (start >= 0 && sourceText[start] !== '{') {
+                start -= 1;
+            }
+
+            if (start < 0) {
+                searchFrom = keywordIndex + keyword.length;
+                continue;
+            }
+
+            let depth = 0;
+            let end = -1;
+            let inString = false;
+            let escaped = false;
+            for (let i = start; i < sourceText.length; i += 1) {
+                const ch = sourceText[i];
+                if (inString) {
+                    if (escaped) {
+                        escaped = false;
+                    } else if (ch === '\\') {
+                        escaped = true;
+                    } else if (ch === '"') {
+                        inString = false;
+                    }
+                    continue;
+                }
+
+                if (ch === '"') {
+                    inString = true;
+                    continue;
+                }
+
+                if (ch === '{') {
+                    depth += 1;
+                    continue;
+                }
+
+                if (ch === '}') {
+                    depth -= 1;
+                    if (depth === 0) {
+                        end = i;
+                        break;
+                    }
+                }
+            }
+
+            if (end > start) {
+                snippets.push(sourceText.slice(start, end + 1));
+                searchFrom = end + 1;
+            } else {
+                searchFrom = keywordIndex + keyword.length;
+            }
+        }
+
+        return snippets;
+    };
+
+    const trimmed = text.trim();
+    const candidates = [trimmed];
+    const fenced = text.match(/```json\s*([\s\S]*?)\s*```/i);
+    if (fenced && fenced[1]) {
+        candidates.push(fenced[1].trim());
+    }
+
+    const genericFenced = text.match(/```\s*([\s\S]*?)\s*```/i);
+    if (genericFenced && genericFenced[1]) {
+        candidates.push(genericFenced[1].trim());
+    }
+
+    candidates.push(...extractObjectSnippetsAroundKeyword(text, '"tool_calls"'));
+    candidates.push(...extractObjectSnippetsAroundKeyword(text, '"tool_call"'));
+
+    const mentionsToolCalls = /"tool_calls"|"tool_call"/i.test(text);
+    const maybeJson = mentionsToolCalls || /^\s*[\[{]/.test(trimmed) || Boolean(fenced?.[1]);
+    let malformed = false;
+
+    for (const candidate of candidates) {
+        if (!candidate) {
+            continue;
+        }
+
+        let parsed;
+        try {
+            parsed = JSON.parse(candidate);
+        } catch (error) {
+            malformed = malformed || mentionsToolCalls;
+            continue;
+        }
+
+        const normalizedResult = normalizeParsedToolCalls(parsed);
+        if (normalizedResult.malformed) {
+            malformed = true;
+            continue;
+        }
+
+        if (normalizedResult.toolCalls.length) {
+            return { toolCalls: normalizedResult.toolCalls, malformed: false };
+        }
+    }
+
+    return { toolCalls: [], malformed: malformed && maybeJson };
+}
+
+function extractFunctionCallOutputs(input) {
+    if (!Array.isArray(input)) {
+        return [];
+    }
+
+    return input.filter((item) => item?.type === 'function_call_output' && item.call_id);
+}
+
+function buildFunctionCallOutputItems(toolCalls, pendingByCallId = new Map()) {
+    return toolCalls.map((toolCall) => {
+        const pending = pendingByCallId.get(toolCall.call_id);
+        const itemId = pending?.item_id || createId('fc');
+        return {
+            id: itemId,
+            type: 'function_call',
+            call_id: toolCall.call_id,
+            name: toolCall.name,
+            arguments: toolCall.arguments,
+            status: 'completed'
+        };
+    });
+}
+
+function resolveFunctionCallOutputTargets(functionCallOutputs, explicitPreviousResponseId, explicitPreviousState) {
+    if (functionCallOutputs.length === 0) {
+        return {
+            continuationState: explicitPreviousState || null,
+            ownershipByCallId: new Map()
+        };
+    }
+
+    if (explicitPreviousResponseId) {
+        if (!explicitPreviousState) {
+            return {
+                error: {
+                    message: 'function_call_output requires a valid previous_response_id',
+                    type: ERROR_TYPE_INVALID_REQUEST
+                }
+            };
+        }
+
+        const ownershipByCallId = new Map(
+            (explicitPreviousState.pendingToolCalls || []).map((call) => [
+                call.call_id,
+                { responseId: explicitPreviousResponseId, state: explicitPreviousState, call }
+            ])
+        );
+
+        return {
+            continuationState: explicitPreviousState,
+            ownershipByCallId
+        };
+    }
+
+    const matchedResponsesByCallId = new Map();
+    const matchedResponseStates = [];
+
+    for (const outputItem of functionCallOutputs) {
+        const callMatches = [];
+
+        for (const [responseId] of responseState.entries()) {
+            const state = getResponseState(responseId);
+            if (!state) {
+                continue;
+            }
+
+            const hasCall = (state.pendingToolCalls || []).some((call) => call.call_id === outputItem.call_id);
+            if (hasCall) {
+                callMatches.push(responseId);
+            }
+        }
+
+        if (callMatches.length === 0) {
+            return {
+                error: {
+                    message: `Unknown function_call_output call_id: ${outputItem.call_id}`,
+                    type: ERROR_TYPE_INVALID_REQUEST
+                }
+            };
+        }
+
+        if (callMatches.length > 1) {
+            return {
+                error: {
+                    message: `Ambiguous function_call_output call_id: ${outputItem.call_id}`,
+                    type: ERROR_TYPE_INVALID_REQUEST
+                }
+            };
+        }
+
+        const responseId = callMatches[0];
+        const state = getResponseState(responseId);
+        if (!state) {
+            return {
+                error: {
+                    message: 'Invalid or expired previous_response_id inferred from function_call_output',
+                    type: ERROR_TYPE_INVALID_REQUEST
+                }
+            };
+        }
+
+        const call = (state.pendingToolCalls || []).find((pendingCall) => pendingCall.call_id === outputItem.call_id);
+        matchedResponsesByCallId.set(outputItem.call_id, { responseId, state, call });
+        matchedResponseStates.push({ responseId, state });
+    }
+
+    const sessionIds = new Set(matchedResponseStates.map((entry) => entry.state.sessionId));
+    const modelIds = new Set(matchedResponseStates.map((entry) => entry.state.model));
+    if (sessionIds.size !== 1 || modelIds.size !== 1) {
+        return {
+            error: {
+                message: 'function_call_output items must target a single continuation context',
+                type: ERROR_TYPE_INVALID_REQUEST
+            }
+        };
+    }
+
+    const continuationState = {
+        sessionId: matchedResponseStates[0].state.sessionId,
+        model: matchedResponseStates[0].state.model,
+        pendingToolCalls: [...matchedResponsesByCallId.values()].map((entry) => entry.call)
+    };
+
+    return {
+        continuationState,
+        ownershipByCallId: matchedResponsesByCallId
+    };
+}
+
+function validateFunctionCallOutputs(functionCallOutputs, ownershipByCallId) {
+    if (functionCallOutputs.length === 0) {
+        return { actionableOutputs: [], alreadyCompletedOutputs: [] };
+    }
+
+    const seen = new Set();
+    const actionableOutputs = [];
+    const alreadyCompletedOutputs = [];
+
+    for (const outputItem of functionCallOutputs) {
+        if (seen.has(outputItem.call_id)) {
+            return {
+                error: {
+                    message: `Duplicate function_call_output call_id in request: ${outputItem.call_id}`,
+                    type: ERROR_TYPE_INVALID_REQUEST
+                }
+            };
+        }
+        seen.add(outputItem.call_id);
+
+        const ownership = ownershipByCallId.get(outputItem.call_id);
+        if (!ownership?.call) {
+            return {
+                error: {
+                    message: `Unknown function_call_output call_id: ${outputItem.call_id}`,
+                    type: ERROR_TYPE_INVALID_REQUEST
+                }
+            };
+        }
+
+        if (ownership.call.status === 'completed') {
+            alreadyCompletedOutputs.push({
+                output: outputItem,
+                call: ownership.call,
+                ownerResponseId: ownership.responseId
+            });
+            continue;
+        }
+
+        actionableOutputs.push({
+            output: outputItem,
+            call: ownership.call,
+            ownerResponseId: ownership.responseId
+        });
+    }
+
+    return { actionableOutputs, alreadyCompletedOutputs };
+}
+
+function toToolResultString(output) {
+    if (typeof output === 'string') {
+        return output;
+    }
+
+    try {
+        return JSON.stringify(output);
+    } catch (error) {
+        return String(output);
+    }
 }
 
 // Auth Middleware
@@ -619,6 +1724,8 @@ app.post('/v1/chat/completions', async (req, res) => {
 });
 
 app.post('/v1/responses', async (req, res) => {
+    const requestId = createId('req');
+    const requestStartedAt = Date.now();
     try {
         const {
             input,
@@ -628,29 +1735,75 @@ app.post('/v1/responses', async (req, res) => {
             previous_response_id: previousResponseId,
             tools,
             tool_choice: toolChoice,
-            parallel_tool_calls: parallelToolCalls
+            parallel_tool_calls: parallelToolCalls,
+            text
         } = req.body || {};
+        const userAgent = req.headers['user-agent'];
 
-        if (tools || toolChoice !== undefined || parallelToolCalls !== undefined) {
+        debugLog('responses.request.received', {
+            requestId,
+            stream: stream === true,
+            model,
+            hasPreviousResponseId: Boolean(previousResponseId),
+            previousResponseId,
+            toolChoiceType: typeof toolChoice,
+            parallelToolCalls,
+            inputSummary: summarizeResponsesInput(input),
+            toolsSummary: summarizeTools(tools),
+            textSummary: {
+                kind: typeof text,
+                keys: text && typeof text === 'object' ? Object.keys(text) : []
+            },
+            userAgent
+        });
+
+        const normalizedToolsResult = normalizeTools(tools);
+        if (normalizedToolsResult.error) {
+            debugLog('responses.tools.invalid', {
+                requestId,
+                error: normalizedToolsResult.error
+            });
             return res.status(400).json({
-                error: {
-                    message: 'tools/function calling for /v1/responses is not enabled in this branch yet',
-                    type: 'invalid_request_error'
-                }
+                error: buildApiError(normalizedToolsResult.error, ERROR_TYPE_INVALID_REQUEST)
             });
         }
 
-        if (Array.isArray(input)) {
-            const hasToolOutputs = input.some((item) => item?.type === 'function_call_output');
-            if (hasToolOutputs) {
+        const normalizedTools = normalizedToolsResult.tools;
+        debugLog('responses.tools.normalized', {
+            requestId,
+            count: normalizedTools.length,
+            names: normalizedTools.map((tool) => tool.name)
+        });
+        const normalizedToolChoice = normalizeToolChoice(toolChoice);
+        if (normalizedToolChoice.mode === 'invalid') {
+            debugLog('responses.tool_choice.invalid', {
+                requestId,
+                reason: normalizedToolChoice.reason
+            });
+            return res.status(400).json({
+                error: buildApiError(normalizedToolChoice.reason, ERROR_TYPE_INVALID_REQUEST)
+            });
+        }
+
+        if (normalizedToolChoice.mode === 'required' && normalizedTools.length === 0) {
+            return res.status(400).json({
+                error: buildApiError('tool_choice=required requires at least one function tool', ERROR_TYPE_INVALID_REQUEST)
+            });
+        }
+
+        if (normalizedToolChoice.mode === 'required' && normalizedToolChoice.name) {
+            const hasNamedTool = normalizedTools.some((tool) => tool.name === normalizedToolChoice.name);
+            if (!hasNamedTool) {
                 return res.status(400).json({
                     error: {
-                        message: 'function_call_output is not enabled in this branch yet',
-                        type: 'invalid_request_error'
+                        message: `tool_choice requires unknown function: ${normalizedToolChoice.name}`,
+                        type: ERROR_TYPE_INVALID_REQUEST
                     }
                 });
             }
         }
+
+        const functionCallOutputs = extractFunctionCallOutputs(input);
 
         let previousState = null;
         if (previousResponseId) {
@@ -659,15 +1812,49 @@ app.post('/v1/responses', async (req, res) => {
                 return res.status(400).json({
                     error: {
                         message: 'Invalid or expired previous_response_id',
-                        type: 'invalid_request_error'
+                        type: ERROR_TYPE_INVALID_REQUEST
                     }
                 });
             }
         }
 
+        const resolvedTargets = resolveFunctionCallOutputTargets(
+            functionCallOutputs,
+            previousResponseId,
+            previousState
+        );
+        if (resolvedTargets.error) {
+            debugLog('responses.function_call_output.resolve_failed', {
+                requestId,
+                error: resolvedTargets.error.message
+            });
+            return res.status(400).json({ error: resolvedTargets.error });
+        }
+
+        const ownershipByCallId = resolvedTargets.ownershipByCallId;
+        previousState = resolvedTargets.continuationState;
+
+        const continuationValidation = validateFunctionCallOutputs(functionCallOutputs, ownershipByCallId);
+        if (continuationValidation.error) {
+            debugLog('responses.function_call_output.invalid', {
+                requestId,
+                error: continuationValidation.error.message
+            });
+            return res.status(400).json({ error: continuationValidation.error });
+        }
+        const actionableFunctionCallOutputs = continuationValidation.actionableOutputs;
+
+        debugLog('responses.function_call_output.summary', {
+            requestId,
+            received: functionCallOutputs.length,
+            actionable: continuationValidation.actionableOutputs.length,
+            alreadyCompleted: continuationValidation.alreadyCompletedOutputs.length
+        });
+
         const selectedModel = model || previousState?.model || 'opencode/big-pickle';
         const { providerId, modelId } = parseModel(selectedModel);
         const client = getClient();
+        const upstreamToolsPolicy = await getDisabledUpstreamToolsPolicy(client, requestId);
 
         try {
             await client.config.update({
@@ -688,21 +1875,134 @@ app.post('/v1/responses', async (req, res) => {
             }
         }
 
-        const messages = normalizeResponsesInputToMessages({ input, instructions });
+        let normalizedInput = input;
+        if (functionCallOutputs.length > 0) {
+            const passthroughItems = Array.isArray(input)
+                ? input.filter((item) => item?.type !== 'function_call_output')
+                : [];
+
+            normalizedInput = passthroughItems;
+
+            if (actionableFunctionCallOutputs.length > 0) {
+                const toolOutputMessages = actionableFunctionCallOutputs.map(({ output, call }) => {
+                    return {
+                        role: 'user',
+                        content: `Tool output for ${call.name} (${output.call_id}): ${toToolResultString(output.output)}`
+                    };
+                });
+
+                normalizedInput = [...passthroughItems, ...toolOutputMessages];
+
+                const resolvedByOwner = new Map();
+                for (const { ownerResponseId, output } of actionableFunctionCallOutputs) {
+                    const resolvedSet = resolvedByOwner.get(ownerResponseId) || new Set();
+                    resolvedSet.add(output.call_id);
+                    resolvedByOwner.set(ownerResponseId, resolvedSet);
+                }
+
+                for (const [ownerResponseId, resolvedCallIds] of resolvedByOwner.entries()) {
+                    const ownerState = getResponseState(ownerResponseId);
+                    if (!ownerState) {
+                        continue;
+                    }
+
+                    const updatedPendingToolCalls = (ownerState.pendingToolCalls || []).map((call) => {
+                        return resolvedCallIds.has(call.call_id)
+                            ? { ...call, status: 'completed' }
+                            : call;
+                    });
+
+                    storeResponseState(ownerResponseId, {
+                        ...ownerState,
+                        pendingToolCalls: updatedPendingToolCalls
+                    });
+                }
+            }
+        }
+
+        const messages = normalizeResponsesInputToMessages({ input: normalizedInput, instructions });
+
+        if (normalizedTools.length > 0) {
+            const formatterToolName = getResponseFormatterToolName(normalizedTools);
+            const toolInstruction = buildToolSystemInstruction(normalizedTools, normalizedToolChoice, parallelToolCalls === true);
+            messages.unshift({ role: 'system', content: toolInstruction });
+
+            debugLog('responses.tools.instruction_built', {
+                requestId,
+                mode: formatterToolName
+                    ? 'langchain_structured_policy'
+                    : 'default_tools_policy',
+                instructionChars: toolInstruction.length
+            });
+        }
+
         if (messages.length === 0) {
+            if (functionCallOutputs.length > 0 && actionableFunctionCallOutputs.length === 0) {
+                const createdAt = Math.floor(Date.now() / 1000);
+                const responseId = createId('resp');
+                const outputMessageId = createId('msg');
+
+                const payload = {
+                    id: responseId,
+                    object: RESPONSES_OBJECT,
+                    created_at: createdAt,
+                    status: 'completed',
+                    model: `${providerId}/${modelId}`,
+                    output: [{
+                        id: outputMessageId,
+                        type: 'message',
+                        role: 'assistant',
+                        status: 'completed',
+                        content: [{ type: 'output_text', text: '' }]
+                    }],
+                    output_text: '',
+                    parallel_tool_calls: parallelToolCalls === true,
+                    usage: {
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        total_tokens: 0,
+                        output_tokens_details: { reasoning_tokens: 0 }
+                    },
+                    error: null
+                };
+
+                return sendResponsesJson(res, payload, requestId, requestStartedAt);
+            }
+
             return res.status(400).json({
                 error: {
                     message: 'input is required when no usable previous_response_id context is provided',
-                    type: 'invalid_request_error'
+                    type: ERROR_TYPE_INVALID_REQUEST
                 }
             });
         }
 
         const { allParts, fullPromptText, systemPrompt } = await buildPromptPartsAndSystem(messages);
 
+        debugLog('responses.prompt.built', {
+            requestId,
+            elapsedMs: Date.now() - requestStartedAt,
+            messageCount: messages.length,
+            partsCount: allParts.length,
+            promptChars: fullPromptText.length,
+            systemChars: systemPrompt.length,
+            model: `${providerId}/${modelId}`,
+            sessionId,
+            stream: stream === true
+        });
+
         const createdAt = Math.floor(Date.now() / 1000);
-        const responseId = `resp_${Date.now()}`;
-        const outputMessageId = `msg_${Date.now()}`;
+        const responseId = createId('resp');
+        const outputMessageId = createId('msg');
+        const enableTools = normalizedTools.length > 0 && normalizedToolChoice.mode !== 'none';
+        const formatterToolName = getResponseFormatterToolName(normalizedTools);
+        const structuredParserMode = enableTools && Boolean(formatterToolName);
+
+        debugLog('responses.tools.mode', {
+            requestId,
+            enableTools,
+            structuredParserMode
+        });
 
         if (stream) {
             res.setHeader('Content-Type', 'text/event-stream');
@@ -712,32 +2012,48 @@ app.post('/v1/responses', async (req, res) => {
             let completionText = '';
             let reasoningText = '';
             let insideReasoning = false;
+            let responseCompleted = false;
+            let assistantMessageStarted = false;
 
             sendResponseSseEvent(res, {
                 type: 'response.created',
                 response: {
                     id: responseId,
-                    object: 'response',
+                    object: RESPONSES_OBJECT,
                     created_at: createdAt,
                     status: 'in_progress',
                     model: `${providerId}/${modelId}`
                 }
             });
 
-            sendResponseSseEvent(res, {
-                type: 'response.output_item.added',
-                response_id: responseId,
-                output_index: 0,
-                item: {
-                    id: outputMessageId,
-                    type: 'message',
-                    role: 'assistant',
-                    status: 'in_progress',
-                    content: [{ type: 'output_text', text: '' }]
+            const ensureAssistantMessageStarted = () => {
+                if (assistantMessageStarted) {
+                    return;
                 }
-            });
+
+                sendResponseSseEvent(res, {
+                    type: 'response.output_item.added',
+                    response_id: responseId,
+                    output_index: 0,
+                    item: {
+                        id: outputMessageId,
+                        type: 'message',
+                        role: 'assistant',
+                        status: 'in_progress',
+                        content: [{ type: 'output_text', text: '' }]
+                    }
+                });
+
+                assistantMessageStarted = true;
+            };
 
             try {
+                debugLog('responses.stream.prompt.start', {
+                    requestId,
+                    elapsedMs: Date.now() - requestStartedAt,
+                    sessionId,
+                    model: `${providerId}/${modelId}`
+                });
                 client.session.prompt({
                     path: { id: sessionId },
                     body: {
@@ -747,6 +2063,7 @@ app.post('/v1/responses', async (req, res) => {
                         },
                         prompt: fullPromptText,
                         system: systemPrompt,
+                        tools: upstreamToolsPolicy,
                         parts: allParts
                     }
                 }).catch((err) => console.warn('Prompt error:', err.message));
@@ -773,45 +2090,57 @@ app.post('/v1/responses', async (req, res) => {
 
                         if (part.type === 'reasoning') {
                             if (!insideReasoning) {
-                                sendResponseSseEvent(res, {
-                                    type: 'response.output_text.delta',
-                                    response_id: responseId,
-                                    output_index: 0,
-                                    content_index: 0,
-                                    delta: '<think>\n'
-                                });
+                                if (!enableTools) {
+                                    ensureAssistantMessageStarted();
+                                    sendResponseSseEvent(res, {
+                                        type: 'response.output_text.delta',
+                                        response_id: responseId,
+                                        output_index: 0,
+                                        content_index: 0,
+                                        delta: '<think>\n'
+                                    });
+                                }
                                 reasoningText += '<think>\n';
                                 insideReasoning = true;
                             }
 
-                            sendResponseSseEvent(res, {
-                                type: 'response.output_text.delta',
-                                response_id: responseId,
-                                output_index: 0,
-                                content_index: 0,
-                                delta
-                            });
-                            reasoningText += delta;
-                        } else if (part.type === 'text') {
-                            if (insideReasoning) {
+                            if (!enableTools) {
+                                ensureAssistantMessageStarted();
                                 sendResponseSseEvent(res, {
                                     type: 'response.output_text.delta',
                                     response_id: responseId,
                                     output_index: 0,
                                     content_index: 0,
-                                    delta: '\n</think>\n\n'
+                                    delta
                                 });
+                            }
+                            reasoningText += delta;
+                        } else if (part.type === 'text') {
+                            if (insideReasoning) {
+                                if (!enableTools) {
+                                    ensureAssistantMessageStarted();
+                                    sendResponseSseEvent(res, {
+                                        type: 'response.output_text.delta',
+                                        response_id: responseId,
+                                        output_index: 0,
+                                        content_index: 0,
+                                        delta: '\n</think>\n\n'
+                                    });
+                                }
                                 reasoningText += '\n</think>\n\n';
                                 insideReasoning = false;
                             }
 
-                            sendResponseSseEvent(res, {
-                                type: 'response.output_text.delta',
-                                response_id: responseId,
-                                output_index: 0,
-                                content_index: 0,
-                                delta
-                            });
+                            if (!enableTools) {
+                                ensureAssistantMessageStarted();
+                                sendResponseSseEvent(res, {
+                                    type: 'response.output_text.delta',
+                                    response_id: responseId,
+                                    output_index: 0,
+                                    content_index: 0,
+                                    delta
+                                });
+                            }
                             completionText += delta;
                         }
                     }
@@ -820,18 +2149,208 @@ app.post('/v1/responses', async (req, res) => {
                         const messageInfo = event.properties?.info;
                         if (messageInfo?.sessionID === sessionId && messageInfo?.finish === 'stop') {
                             if (insideReasoning) {
-                                sendResponseSseEvent(res, {
-                                    type: 'response.output_text.delta',
-                                    response_id: responseId,
-                                    output_index: 0,
-                                    content_index: 0,
-                                    delta: '\n</think>\n\n'
-                                });
+                                if (!enableTools) {
+                                    ensureAssistantMessageStarted();
+                                    sendResponseSseEvent(res, {
+                                        type: 'response.output_text.delta',
+                                        response_id: responseId,
+                                        output_index: 0,
+                                        content_index: 0,
+                                        delta: '\n</think>\n\n'
+                                    });
+                                }
                                 reasoningText += '\n</think>\n\n';
                             }
 
                             const usage = buildResponsesUsage(fullPromptText, completionText, reasoningText);
+                            const extracted = enableTools
+                                ? extractToolCallsFromText(completionText)
+                                : { toolCalls: [], malformed: false };
+                            const toolCalls = extracted.toolCalls;
+                            const finalizerCalled = Boolean(formatterToolName)
+                                && toolCalls.some((call) => call.name === formatterToolName);
 
+                            debugLog('responses.stream.tool_extraction', {
+                                requestId,
+                                extractedCount: toolCalls.length,
+                                malformed: extracted.malformed,
+                                structuredParserMode,
+                                finalizerCalled
+                            });
+
+                            if (enableTools && extracted.malformed) {
+                                sendResponseSseEvent(res, {
+                                    type: 'error',
+                                    error: {
+                                        message: 'Malformed tool call payload from model output',
+                                        type: ERROR_TYPE_INVALID_RESPONSE
+                                    }
+                                });
+                                res.end();
+                                responseCompleted = true;
+                                break;
+                            }
+
+                            if (enableTools && normalizedToolChoice.mode === 'required' && toolCalls.length === 0) {
+                                sendResponseSseEvent(res, {
+                                    type: 'error',
+                                    error: {
+                                        message: 'Model did not produce required function call output',
+                                        type: ERROR_TYPE_INVALID_RESPONSE
+                                    }
+                                });
+                                res.end();
+                                responseCompleted = true;
+                                break;
+                            }
+
+                            if (structuredParserMode && toolCalls.length === 0) {
+                                sendResponseSseEvent(res, {
+                                    type: 'error',
+                                    error: {
+                                        message: 'Structured parser mode requires at least one function call output',
+                                        type: ERROR_TYPE_INVALID_RESPONSE
+                                    }
+                                });
+                                res.end();
+                                responseCompleted = true;
+                                break;
+                            }
+
+                            if (toolCalls.length > 0 && parallelToolCalls !== true && toolCalls.length > 1) {
+                                sendResponseSseEvent(res, {
+                                    type: 'error',
+                                    error: {
+                                        message: 'Model returned multiple tool calls while parallel_tool_calls is false',
+                                        type: ERROR_TYPE_INVALID_RESPONSE
+                                    }
+                                });
+                                res.end();
+                                responseCompleted = true;
+                                break;
+                            }
+
+                            if (toolCalls.length > 0) {
+                                const validatedCalls = [];
+                                for (const toolCall of toolCalls) {
+                                    const toolDef = normalizedTools.find((tool) => tool.name === toolCall.name);
+                                    if (!toolDef) {
+                                        sendResponseSseEvent(res, {
+                                            type: 'error',
+                                            error: {
+                                                message: `Model attempted unknown tool: ${toolCall.name}`,
+                                                type: ERROR_TYPE_INVALID_RESPONSE
+                                            }
+                                        });
+                                        res.end();
+                                        responseCompleted = true;
+                                        break;
+                                    }
+                                    validatedCalls.push(toolCall);
+                                }
+
+                                if (responseCompleted) {
+                                    break;
+                                }
+
+                                if (normalizedToolChoice.mode === 'required' && normalizedToolChoice.name) {
+                                    const hasRequiredCall = validatedCalls.some((call) => call.name === normalizedToolChoice.name);
+                                    if (!hasRequiredCall) {
+                                        sendResponseSseEvent(res, {
+                                            type: 'error',
+                                            error: {
+                                                message: `Model did not call required function: ${normalizedToolChoice.name}`,
+                                                type: ERROR_TYPE_INVALID_RESPONSE
+                                            }
+                                        });
+                                        res.end();
+                                        responseCompleted = true;
+                                        break;
+                                    }
+                                }
+
+                                const outputItems = buildFunctionCallOutputItems(validatedCalls);
+                                for (let idx = 0; idx < outputItems.length; idx += 1) {
+                                    const outputItem = outputItems[idx];
+
+                                    sendResponseSseEvent(res, {
+                                        type: 'response.output_item.added',
+                                        response_id: responseId,
+                                        output_index: idx,
+                                        item: {
+                                            id: outputItem.id,
+                                            type: 'function_call',
+                                            call_id: outputItem.call_id,
+                                            name: outputItem.name,
+                                            arguments: '',
+                                            status: 'in_progress'
+                                        }
+                                    });
+
+                                    sendResponseSseEvent(res, {
+                                        type: 'response.function_call_arguments.delta',
+                                        response_id: responseId,
+                                        output_index: idx,
+                                        item_id: outputItem.id,
+                                        delta: outputItem.arguments
+                                    });
+
+                                    sendResponseSseEvent(res, {
+                                        type: 'response.function_call_arguments.done',
+                                        response_id: responseId,
+                                        output_index: idx,
+                                        item_id: outputItem.id,
+                                        arguments: outputItem.arguments
+                                    });
+
+                                    sendResponseSseEvent(res, {
+                                        type: 'response.output_item.done',
+                                        response_id: responseId,
+                                        output_index: idx,
+                                        item: outputItem
+                                    });
+                                }
+
+                                sendResponseSseEvent(res, {
+                                    type: 'response.completed',
+                                    response: {
+                                        id: responseId,
+                                        object: RESPONSES_OBJECT,
+                                        created_at: createdAt,
+                                        status: 'completed',
+                                        model: `${providerId}/${modelId}`,
+                                        output: outputItems,
+                                        usage,
+                                        error: null
+                                    }
+                                });
+
+                                debugLog('responses.stream.completed.tools', {
+                                    requestId,
+                                    elapsedMs: Date.now() - requestStartedAt,
+                                    outputCount: outputItems.length
+                                });
+
+                                storeResponseState(responseId, {
+                                    sessionId,
+                                    model: `${providerId}/${modelId}`,
+                                    pendingToolCalls: outputItems.map((item) => ({
+                                        call_id: item.call_id,
+                                        name: item.name,
+                                        arguments: item.arguments,
+                                        item_id: item.id,
+                                        status: 'pending'
+                                    }))
+                                });
+
+                                res.write('data: [DONE]\n\n');
+                                clearInterval(keepaliveInterval);
+                                res.end();
+                                responseCompleted = true;
+                                break;
+                            }
+
+                            ensureAssistantMessageStarted();
                             sendResponseSseEvent(res, {
                                 type: 'response.output_item.done',
                                 response_id: responseId,
@@ -849,7 +2368,7 @@ app.post('/v1/responses', async (req, res) => {
                                 type: 'response.completed',
                                 response: {
                                     id: responseId,
-                                    object: 'response',
+                                    object: RESPONSES_OBJECT,
                                     created_at: createdAt,
                                     status: 'completed',
                                     model: `${providerId}/${modelId}`,
@@ -865,14 +2384,22 @@ app.post('/v1/responses', async (req, res) => {
                                 }
                             });
 
+                            debugLog('responses.stream.completed.message', {
+                                requestId,
+                                elapsedMs: Date.now() - requestStartedAt,
+                                textChars: `${reasoningText}${completionText}`.length
+                            });
+
                             storeResponseState(responseId, {
                                 sessionId,
-                                model: `${providerId}/${modelId}`
+                                model: `${providerId}/${modelId}`,
+                                pendingToolCalls: []
                             });
 
                             res.write('data: [DONE]\n\n');
                             clearInterval(keepaliveInterval);
                             res.end();
+                            responseCompleted = true;
                             break;
                         }
                     }
@@ -881,6 +2408,11 @@ app.post('/v1/responses', async (req, res) => {
                 clearInterval(keepaliveInterval);
             } catch (streamError) {
                 console.error('Responses streaming error:', streamError);
+                debugLog('responses.stream.error', {
+                    requestId,
+                    elapsedMs: Date.now() - requestStartedAt,
+                    error: getErrorDetails(streamError)
+                });
                 if (!res.destroyed) {
                     sendResponseSseEvent(res, {
                         type: 'error',
@@ -895,40 +2427,207 @@ app.post('/v1/responses', async (req, res) => {
             return;
         }
 
-        const responseRes = await client.session.prompt({
-            path: { id: sessionId },
-            body: {
-                model: {
-                    providerID: providerId,
-                    modelID: modelId
-                },
-                prompt: fullPromptText,
-                system: systemPrompt,
-                parts: allParts
-            }
-        });
+        const useEventStreamForNonStreaming = Boolean(formatterToolName);
+        let content = '';
+        let reasoningContent = '';
+        let extractedToolCalls = { toolCalls: [], malformed: false };
+        let extractionSource = 'text_fallback';
 
-        const parts = responseRes.data?.parts || [];
-        const content = parts
-            .filter((p) => p.type === 'text')
-            .map((p) => p.text)
-            .join('\n');
-        const reasoningContent = parts
-            .filter((p) => p.type === 'reasoning')
-            .map((p) => p.text)
-            .join('\n');
+        if (useEventStreamForNonStreaming) {
+            debugLog('responses.non_stream.execution_mode', {
+                requestId,
+                mode: 'event_stream'
+            });
+            const collected = await collectResponseViaEventStream({
+                client,
+                sessionId,
+                providerId,
+                modelId,
+                fullPromptText,
+                systemPrompt,
+                allParts,
+                upstreamToolsPolicy,
+                requestId,
+                requestStartedAt
+            });
+            content = collected.completionText;
+            reasoningContent = collected.reasoningText;
+
+            if (collected.structuredToolCalls.length > 0 || collected.structuredToolCallMalformed) {
+                extractedToolCalls = {
+                    toolCalls: collected.structuredToolCalls,
+                    malformed: collected.structuredToolCallMalformed
+                };
+                extractionSource = 'structured_event_parts';
+            }
+        } else {
+            debugLog('responses.non_stream.execution_mode', {
+                requestId,
+                mode: 'single_prompt'
+            });
+
+            debugLog('responses.non_stream.prompt.start', {
+                requestId,
+                elapsedMs: Date.now() - requestStartedAt,
+                sessionId,
+                model: `${providerId}/${modelId}`,
+                promptChars: fullPromptText.length,
+                systemChars: systemPrompt.length,
+                partsCount: allParts.length
+            });
+
+            const responseRes = await client.session.prompt({
+                path: { id: sessionId },
+                body: {
+                    model: {
+                        providerID: providerId,
+                        modelID: modelId
+                    },
+                    prompt: fullPromptText,
+                    system: systemPrompt,
+                    tools: upstreamToolsPolicy,
+                    parts: allParts
+                }
+            });
+
+            debugLog('responses.non_stream.prompt.returned', {
+                requestId,
+                elapsedMs: Date.now() - requestStartedAt,
+                partsCount: Array.isArray(responseRes.data?.parts) ? responseRes.data.parts.length : 0,
+                dataType: typeof responseRes.data
+            });
+
+            const parts = responseRes.data?.parts || [];
+            content = parts
+                .filter((p) => p.type === 'text')
+                .map((p) => p.text)
+                .join('\n');
+            reasoningContent = parts
+                .filter((p) => p.type === 'reasoning')
+                .map((p) => p.text)
+                .join('\n');
+        }
 
         const finalOutputText = buildResponsesOutputText(content, reasoningContent);
         const usage = buildResponsesUsage(fullPromptText, content, reasoningContent);
 
-        storeResponseState(responseId, {
-            sessionId,
-            model: `${providerId}/${modelId}`
+        if (enableTools && extractedToolCalls.toolCalls.length === 0 && extractedToolCalls.malformed === false) {
+            extractedToolCalls = extractToolCallsFromText(content);
+            extractionSource = 'text_json';
+        }
+
+        const toolCalls = extractedToolCalls.toolCalls;
+        const finalizerCalled = Boolean(formatterToolName)
+            && toolCalls.some((call) => call.name === formatterToolName);
+
+        debugLog('responses.non_stream.tool_extraction', {
+            requestId,
+            extractionSource,
+            extractedCount: toolCalls.length,
+            malformed: extractedToolCalls.malformed,
+            structuredParserMode,
+            finalizerCalled
         });
 
-        return res.json({
+        if (enableTools && extractedToolCalls.malformed) {
+            return res.status(500).json({
+                error: {
+                    message: 'Malformed tool call payload from model output',
+                    type: ERROR_TYPE_INVALID_RESPONSE
+                }
+            });
+        }
+
+        if (enableTools && normalizedToolChoice.mode === 'required' && toolCalls.length === 0) {
+            return res.status(500).json({
+                error: {
+                    message: 'Model did not produce required function call output',
+                    type: ERROR_TYPE_INVALID_RESPONSE
+                }
+            });
+        }
+
+        if (structuredParserMode && toolCalls.length === 0) {
+            return res.status(500).json({
+                error: {
+                    message: 'Structured parser mode requires at least one function call output',
+                    type: ERROR_TYPE_INVALID_RESPONSE
+                }
+            });
+        }
+
+        if (toolCalls.length > 0 && parallelToolCalls !== true && toolCalls.length > 1) {
+            return res.status(500).json({
+                error: {
+                    message: 'Model returned multiple tool calls while parallel_tool_calls is false',
+                    type: ERROR_TYPE_INVALID_RESPONSE
+                }
+            });
+        }
+
+        if (toolCalls.length > 0) {
+            for (const toolCall of toolCalls) {
+                const toolDef = normalizedTools.find((tool) => tool.name === toolCall.name);
+                if (!toolDef) {
+                    return res.status(400).json({
+                        error: {
+                            message: `Model attempted unknown tool: ${toolCall.name}`,
+                            type: ERROR_TYPE_INVALID_RESPONSE
+                        }
+                    });
+                }
+            }
+
+            if (normalizedToolChoice.mode === 'required' && normalizedToolChoice.name) {
+                const hasRequiredCall = toolCalls.some((call) => call.name === normalizedToolChoice.name);
+                if (!hasRequiredCall) {
+                    return res.status(500).json({
+                        error: {
+                            message: `Model did not call required function: ${normalizedToolChoice.name}`,
+                            type: ERROR_TYPE_INVALID_RESPONSE
+                        }
+                    });
+                }
+            }
+
+            const output = buildFunctionCallOutputItems(toolCalls);
+
+            storeResponseState(responseId, {
+                sessionId,
+                model: `${providerId}/${modelId}`,
+                pendingToolCalls: output.map((item) => ({
+                    call_id: item.call_id,
+                    name: item.name,
+                    arguments: item.arguments,
+                    item_id: item.id,
+                    status: 'pending'
+                }))
+            });
+
+            const payload = {
+                id: responseId,
+                object: RESPONSES_OBJECT,
+                created_at: createdAt,
+                status: 'completed',
+                model: `${providerId}/${modelId}`,
+                output,
+                parallel_tool_calls: parallelToolCalls === true,
+                usage,
+                error: null
+            };
+
+            return sendResponsesJson(res, payload, requestId, requestStartedAt);
+        }
+
+        storeResponseState(responseId, {
+            sessionId,
+            model: `${providerId}/${modelId}`,
+            pendingToolCalls: []
+        });
+
+        const payload = {
             id: responseId,
-            object: 'response',
+            object: RESPONSES_OBJECT,
             created_at: createdAt,
             status: 'completed',
             model: `${providerId}/${modelId}`,
@@ -940,12 +2639,19 @@ app.post('/v1/responses', async (req, res) => {
                 content: [{ type: 'output_text', text: finalOutputText }]
             }],
             output_text: finalOutputText,
-            parallel_tool_calls: false,
+            parallel_tool_calls: parallelToolCalls === true,
             usage,
             error: null
-        });
+        };
+
+        return sendResponsesJson(res, payload, requestId, requestStartedAt);
     } catch (error) {
         console.error('Responses API Proxy Error:', error);
+        debugLog('responses.request.error', {
+            requestId,
+            elapsedMs: Date.now() - requestStartedAt,
+            error: getErrorDetails(error)
+        });
         const errorMessage = error.response?.data?.error?.message || error.message || 'Unknown error';
         return res.status(500).json({
             error: {
