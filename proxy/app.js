@@ -282,15 +282,149 @@ async function getImageDataUri(url) {
  * @returns {object} The OpenCode SDK client
  */
 function getClient() {
-    const serverPassword = process.env.OPENCODE_SERVER_PASSWORD;
     const baseUrl = `http://127.0.0.1:${TARGET_PORT}`;
-    const headers = {};
-    
-    if (serverPassword) {
-        headers['Authorization'] = 'Basic ' + Buffer.from(`opencode:${serverPassword}`).toString('base64');
-    }
+    const headers = getUpstreamAuthHeaders();
 
     return createOpencodeClient({ baseUrl, headers });
+}
+
+function getUpstreamAuthHeaders() {
+    const serverPassword = process.env.OPENCODE_SERVER_PASSWORD;
+    const headers = {};
+
+    if (serverPassword) {
+        headers.Authorization = 'Basic ' + Buffer.from(`opencode:${serverPassword}`).toString('base64');
+    }
+
+    return headers;
+}
+
+function isIntegerArray(value) {
+    return Array.isArray(value) && value.every((item) => Number.isInteger(item));
+}
+
+function normalizeEmbeddingsInput(input) {
+    if (typeof input === 'string') {
+        return { input };
+    }
+
+    if (!Array.isArray(input)) {
+        return {
+            error: 'input must be a string, an array of strings, or an array of token arrays'
+        };
+    }
+
+    if (input.length === 0) {
+        return {
+            error: 'input array must not be empty'
+        };
+    }
+
+    if (input.every((item) => typeof item === 'string')) {
+        return { input };
+    }
+
+    if (isIntegerArray(input)) {
+        return { input };
+    }
+
+    if (input.every((item) => isIntegerArray(item))) {
+        return { input };
+    }
+
+    return {
+        error: 'input array must contain only strings or token integer arrays'
+    };
+}
+
+function estimateEmbeddingsUsage(input) {
+    if (typeof input === 'string') {
+        const promptTokens = Math.ceil(input.length / 4);
+        return { prompt_tokens: promptTokens, total_tokens: promptTokens };
+    }
+
+    if (!Array.isArray(input)) {
+        return { prompt_tokens: 0, total_tokens: 0 };
+    }
+
+    const promptTokens = input.reduce((acc, item) => {
+        if (typeof item === 'string') {
+            return acc + Math.ceil(item.length / 4);
+        }
+
+        if (isIntegerArray(item)) {
+            return acc + item.length;
+        }
+
+        return acc;
+    }, 0);
+
+    return { prompt_tokens: promptTokens, total_tokens: promptTokens };
+}
+
+function normalizeEmbeddingItem(rawItem, index) {
+    if (rawItem && typeof rawItem === 'object' && Object.prototype.hasOwnProperty.call(rawItem, 'embedding')) {
+        const rawIndex = Number.isInteger(rawItem.index) ? rawItem.index : index;
+        return {
+            object: 'embedding',
+            index: rawIndex,
+            embedding: rawItem.embedding
+        };
+    }
+
+    if (Array.isArray(rawItem) || typeof rawItem === 'string') {
+        return {
+            object: 'embedding',
+            index,
+            embedding: rawItem
+        };
+    }
+
+    return null;
+}
+
+function normalizeEmbeddingsResponse(data, requestedModel, requestedInput) {
+    const rawData = Array.isArray(data?.data)
+        ? data.data
+        : Array.isArray(data?.embeddings)
+            ? data.embeddings
+            : null;
+
+    if (!rawData) {
+        return null;
+    }
+
+    const normalizedData = rawData
+        .map((item, index) => normalizeEmbeddingItem(item, index))
+        .filter(Boolean);
+
+    if (normalizedData.length === 0) {
+        return null;
+    }
+
+    const usage = {
+        ...estimateEmbeddingsUsage(requestedInput),
+        ...(data?.usage && typeof data.usage === 'object' ? data.usage : {})
+    };
+
+    const promptTokens = Number.isFinite(usage.prompt_tokens)
+        ? usage.prompt_tokens
+        : 0;
+    const totalTokens = Number.isFinite(usage.total_tokens)
+        ? usage.total_tokens
+        : promptTokens;
+
+    return {
+        object: 'list',
+        data: normalizedData,
+        model: typeof data?.model === 'string' && data.model.trim()
+            ? data.model
+            : requestedModel,
+        usage: {
+            prompt_tokens: promptTokens,
+            total_tokens: totalTokens
+        }
+    };
 }
 
 function parseModel(model) {
@@ -2652,6 +2786,140 @@ app.post('/v1/responses', async (req, res) => {
             elapsedMs: Date.now() - requestStartedAt,
             error: getErrorDetails(error)
         });
+        const errorMessage = error.response?.data?.error?.message || error.message || 'Unknown error';
+        return res.status(500).json({
+            error: {
+                message: 'Internal Proxy Error',
+                details: errorMessage
+            }
+        });
+    }
+});
+
+app.post('/v1/embeddings', async (req, res) => {
+    const requestId = createId('req');
+    const requestStartedAt = Date.now();
+
+    try {
+        const {
+            input,
+            model,
+            dimensions,
+            encoding_format: encodingFormat,
+            user
+        } = req.body || {};
+
+        debugLog('embeddings.request.received', {
+            requestId,
+            model,
+            hasInput: input !== undefined,
+            dimensions,
+            encodingFormat,
+            inputType: Array.isArray(input) ? 'array' : typeof input
+        });
+
+        const normalizedInputResult = normalizeEmbeddingsInput(input);
+        if (normalizedInputResult.error) {
+            return res.status(400).json({
+                error: buildApiError(normalizedInputResult.error, ERROR_TYPE_INVALID_REQUEST)
+            });
+        }
+
+        if (model !== undefined && (typeof model !== 'string' || model.trim() === '')) {
+            return res.status(400).json({
+                error: buildApiError('model must be a non-empty string when provided', ERROR_TYPE_INVALID_REQUEST)
+            });
+        }
+
+        if (encodingFormat !== undefined && encodingFormat !== 'float' && encodingFormat !== 'base64') {
+            return res.status(400).json({
+                error: buildApiError('encoding_format must be either "float" or "base64"', ERROR_TYPE_INVALID_REQUEST)
+            });
+        }
+
+        if (dimensions !== undefined && (!Number.isInteger(dimensions) || dimensions <= 0)) {
+            return res.status(400).json({
+                error: buildApiError('dimensions must be a positive integer', ERROR_TYPE_INVALID_REQUEST)
+            });
+        }
+
+        const normalizedModel = (() => {
+            if (typeof model !== 'string' || model.trim() === '') {
+                return 'opencode/text-embedding-3-small';
+            }
+
+            const cleanedModel = model.trim();
+            if (cleanedModel.includes('/')) {
+                const { providerId, modelId } = parseModel(cleanedModel);
+                return `${providerId}/${modelId}`;
+            }
+
+            return `opencode/${cleanedModel}`;
+        })();
+
+        const requestBody = {
+            model: normalizedModel,
+            input: normalizedInputResult.input
+        };
+
+        if (dimensions !== undefined) {
+            requestBody.dimensions = dimensions;
+        }
+
+        if (encodingFormat !== undefined) {
+            requestBody.encoding_format = encodingFormat;
+        }
+
+        if (user !== undefined) {
+            requestBody.user = user;
+        }
+
+        const upstreamResponse = await axios.post(
+            `http://127.0.0.1:${TARGET_PORT}/v1/embeddings`,
+            requestBody,
+            {
+                headers: {
+                    'Content-Type': 'application/json',
+                    ...getUpstreamAuthHeaders()
+                }
+            }
+        );
+
+        const payload = normalizeEmbeddingsResponse(
+            upstreamResponse?.data,
+            normalizedModel,
+            normalizedInputResult.input
+        );
+
+        if (!payload) {
+            throw new Error('Unexpected embeddings response shape from upstream');
+        }
+
+        debugLog('embeddings.response_payload', {
+            requestId,
+            elapsedMs: Date.now() - requestStartedAt,
+            model: payload.model,
+            embeddingCount: payload.data.length,
+            usage: payload.usage
+        });
+
+        return res.json(payload);
+    } catch (error) {
+        debugLog('embeddings.request.error', {
+            requestId,
+            elapsedMs: Date.now() - requestStartedAt,
+            error: getErrorDetails(error)
+        });
+
+        if (error.response?.status) {
+            const upstreamStatus = error.response.status;
+            const upstreamError = error.response.data?.error;
+
+            if (upstreamError) {
+                return res.status(upstreamStatus).json({ error: upstreamError });
+            }
+        }
+
         const errorMessage = error.response?.data?.error?.message || error.message || 'Unknown error';
         return res.status(500).json({
             error: {

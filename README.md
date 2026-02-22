@@ -128,6 +128,19 @@ curl http://localhost:4096/v1/responses \
   }'
 ```
 
+### Embeddings API Example
+```bash
+curl http://localhost:4096/v1/embeddings \
+  -H "Authorization: Bearer <YOUR_PASSWORD>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "opencode/text-embedding-3-small",
+    "input": "Your text string goes here"
+  }'
+```
+
+Optional fields like `dimensions`, `encoding_format` (`float` or `base64`), and `user` are forwarded when provided.
+
 `/v1/responses` also supports function/tool calling with `tools`, `tool_choice`, and `function_call_output` continuation using `previous_response_id`.
 
 LangChain compatibility notes:

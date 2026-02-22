@@ -7,7 +7,54 @@ jest.unstable_mockModule('axios', () => ({
         get: jest.fn(async () => ({
             data: Buffer.from('fake-image-data'),
             headers: { 'content-type': 'image/png' }
-        }))
+        })),
+        post: jest.fn(async (url, body) => {
+            if (typeof url === 'string' && url.includes('/v1/embeddings')) {
+                const sourceInputs = (() => {
+                    if (typeof body.input === 'string') {
+                        return [body.input];
+                    }
+
+                    if (Array.isArray(body.input) && body.input.every((item) => typeof item === 'string')) {
+                        return body.input;
+                    }
+
+                    if (Array.isArray(body.input) && body.input.every((item) => Number.isInteger(item))) {
+                        return [body.input];
+                    }
+
+                    if (Array.isArray(body.input) && body.input.every((item) => Array.isArray(item) && item.every((token) => Number.isInteger(token)))) {
+                        return body.input;
+                    }
+
+                    return [];
+                })();
+
+                return {
+                    data: {
+                        object: 'list',
+                        data: sourceInputs.map((item, index) => ({
+                            object: 'embedding',
+                            index,
+                            embedding: body.encoding_format === 'base64'
+                                ? `embedding_${index}`
+                                : [
+                                    typeof item === 'string' ? item.length / 10 : item.length,
+                                    index + 1,
+                                    0.5
+                                ]
+                        })),
+                        model: body.model,
+                        usage: {
+                            prompt_tokens: Math.max(1, sourceInputs.length * 2),
+                            total_tokens: Math.max(1, sourceInputs.length * 2)
+                        }
+                    }
+                };
+            }
+
+            throw new Error(`Unexpected axios.post URL: ${url}`);
+        })
     }
 }));
 
@@ -256,6 +303,7 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
 
 // Importa o app dinamicamente para que o mock seja aplicado
 const { default: app } = await import('../app.js');
+const { default: axios } = await import('axios');
 
 function parseSseEvents(bodyText) {
     return bodyText
@@ -401,6 +449,84 @@ describe('Proxy OpenAI API', () => {
         expect(res.body.status).toEqual('completed');
         expect(res.body.output[0].type).toEqual('message');
         expect(res.body.output[0].content[0].type).toEqual('output_text');
+    });
+
+    test('POST /v1/embeddings deve retornar formato OpenAI compatível para input string', async () => {
+        const res = await request(app)
+            .post('/v1/embeddings')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                model: 'opencode/text-embedding-3-small',
+                input: 'Cats are great'
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.body.object).toEqual('list');
+        expect(res.body.model).toEqual('opencode/text-embedding-3-small');
+        expect(res.body.data).toHaveLength(1);
+        expect(res.body.data[0]).toMatchObject({
+            object: 'embedding',
+            index: 0
+        });
+        expect(Array.isArray(res.body.data[0].embedding)).toEqual(true);
+        expect(res.body.usage).toMatchObject({
+            prompt_tokens: expect.any(Number),
+            total_tokens: expect.any(Number)
+        });
+    });
+
+    test('POST /v1/embeddings deve suportar batch input', async () => {
+        const res = await request(app)
+            .post('/v1/embeddings')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                model: 'text-embedding-3-small',
+                input: ['Cats are great', 'Dogs are great too']
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.body.model).toEqual('opencode/text-embedding-3-small');
+        expect(res.body.data).toHaveLength(2);
+        expect(res.body.data[0].index).toEqual(0);
+        expect(res.body.data[1].index).toEqual(1);
+    });
+
+    test('POST /v1/embeddings deve validar input inválido', async () => {
+        const res = await request(app)
+            .post('/v1/embeddings')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                model: 'opencode/text-embedding-3-small',
+                input: { text: 'invalid' }
+            });
+
+        expect(res.statusCode).toEqual(400);
+        expect(res.body.error.type).toEqual('invalid_request_error');
+        expect(res.body.error.message).toContain('input');
+    });
+
+    test('POST /v1/embeddings deve encaminhar dimensions e encoding_format', async () => {
+        const res = await request(app)
+            .post('/v1/embeddings')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                model: 'text-embedding-3-large',
+                input: 'Vectorize this',
+                dimensions: 256,
+                encoding_format: 'base64'
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(typeof res.body.data[0].embedding).toEqual('string');
+        expect(axios.post).toHaveBeenCalledWith(
+            expect.stringContaining('/v1/embeddings'),
+            expect.objectContaining({
+                model: 'opencode/text-embedding-3-large',
+                dimensions: 256,
+                encoding_format: 'base64'
+            }),
+            expect.any(Object)
+        );
     });
 
     test('POST /v1/responses deve suportar stream no formato responses', async () => {
