@@ -567,6 +567,59 @@ describe('Proxy OpenAI API', () => {
         });
     });
 
+    test('POST /v1/embeddings deve aceitar payload upstream stringificado com embeddings[].values', async () => {
+        axios.post.mockResolvedValueOnce({
+            data: JSON.stringify({
+                embeddings: [
+                    { values: [0.2, 0.4, 0.6], index: 0 },
+                    { values: [0.1, 0.3, 0.5], index: 1 }
+                ],
+                model: 'google/gemini-embedding-001'
+            }),
+            headers: { 'content-type': 'text/plain; charset=utf-8' }
+        });
+
+        const res = await request(app)
+            .post('/v1/embeddings')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                model: 'google/gemini-embedding-001',
+                input: ['alpha', 'beta'],
+                encoding_format: 'base64'
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.body.object).toEqual('list');
+        expect(res.body.data).toHaveLength(2);
+        expect(typeof res.body.data[0].embedding).toEqual('string');
+    });
+
+    test('POST /v1/embeddings deve aceitar payload upstream stringificado com embedding.values', async () => {
+        axios.post.mockResolvedValueOnce({
+            data: JSON.stringify({
+                embedding: {
+                    values: [0.7, 0.8, 0.9]
+                },
+                model: 'google/gemini-embedding-001'
+            }),
+            headers: { 'content-type': 'application/json; charset=utf-8' }
+        });
+
+        const res = await request(app)
+            .post('/v1/embeddings')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                model: 'google/gemini-embedding-001',
+                input: 'alpha',
+                encoding_format: 'base64'
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.body.object).toEqual('list');
+        expect(res.body.data).toHaveLength(1);
+        expect(typeof res.body.data[0].embedding).toEqual('string');
+    });
+
     test('POST /v1/responses deve suportar stream no formato responses', async () => {
         const res = await request(app)
             .post('/v1/responses')

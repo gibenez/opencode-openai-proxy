@@ -307,6 +307,39 @@ function isNumberArray(value) {
     return Array.isArray(value) && value.every((item) => typeof item === 'number' && Number.isFinite(item));
 }
 
+function coerceEmbeddingsPayload(rawPayload) {
+    if (typeof rawPayload !== 'string') {
+        return {
+            data: rawPayload,
+            parsedFromString: false,
+            parseError: null
+        };
+    }
+
+    const trimmed = rawPayload.trim();
+    if (!trimmed) {
+        return {
+            data: rawPayload,
+            parsedFromString: false,
+            parseError: null
+        };
+    }
+
+    try {
+        return {
+            data: JSON.parse(trimmed),
+            parsedFromString: true,
+            parseError: null
+        };
+    } catch (error) {
+        return {
+            data: rawPayload,
+            parsedFromString: false,
+            parseError: error.message
+        };
+    }
+}
+
 function normalizeEmbeddingsInput(input) {
     if (typeof input === 'string') {
         return { input };
@@ -367,12 +400,36 @@ function estimateEmbeddingsUsage(input) {
 }
 
 function normalizeEmbeddingItem(rawItem, index) {
+    const resolveEmbeddingValue = (value) => {
+        if (Array.isArray(value) || typeof value === 'string') {
+            return value;
+        }
+
+        if (value && typeof value === 'object') {
+            if (Object.prototype.hasOwnProperty.call(value, 'values')) {
+                return value.values;
+            }
+            if (Object.prototype.hasOwnProperty.call(value, 'vector')) {
+                return value.vector;
+            }
+            if (Object.prototype.hasOwnProperty.call(value, 'embedding')) {
+                return resolveEmbeddingValue(value.embedding);
+            }
+        }
+
+        return null;
+    };
+
     if (rawItem && typeof rawItem === 'object' && Object.prototype.hasOwnProperty.call(rawItem, 'embedding')) {
         const rawIndex = Number.isInteger(rawItem.index) ? rawItem.index : index;
+        const embeddingValue = resolveEmbeddingValue(rawItem.embedding);
+        if (embeddingValue === null) {
+            return null;
+        }
         return {
             object: 'embedding',
             index: rawIndex,
-            embedding: rawItem.embedding
+            embedding: embeddingValue
         };
     }
 
@@ -430,6 +487,14 @@ function normalizeEmbeddingEncoding(embedding, requestedEncodingFormat) {
 }
 
 function summarizeEmbeddingsShape(data) {
+    if (typeof data === 'string') {
+        return {
+            type: 'string',
+            length: data.length,
+            preview: data.slice(0, 200)
+        };
+    }
+
     if (!data || typeof data !== 'object') {
         return { type: typeof data };
     }
@@ -456,10 +521,14 @@ function summarizeEmbeddingsShape(data) {
 }
 
 function normalizeEmbeddingsResponse(data, requestedModel, requestedInput, requestedEncodingFormat) {
-    const rawData = Array.isArray(data?.data)
+    const rawData = Array.isArray(data)
+        ? data
+        : Array.isArray(data?.data)
         ? data.data
         : Array.isArray(data?.embeddings)
             ? data.embeddings
+            : data && typeof data === 'object' && data.embedding !== undefined
+                ? [data.embedding]
             : data && typeof data === 'object' && data.data && typeof data.data === 'object'
                 ? [data.data]
                 : data && typeof data === 'object' && (
@@ -2975,8 +3044,10 @@ app.post('/v1/embeddings', async (req, res) => {
             }
         );
 
+        const coercedPayload = coerceEmbeddingsPayload(upstreamResponse?.data);
+
         const payload = normalizeEmbeddingsResponse(
-            upstreamResponse?.data,
+            coercedPayload.data,
             normalizedModel,
             normalizedInputResult.input,
             encodingFormat
@@ -2985,7 +3056,10 @@ app.post('/v1/embeddings', async (req, res) => {
         if (!payload) {
             debugLog('embeddings.response_shape.unrecognized', {
                 requestId,
-                upstreamShape: summarizeEmbeddingsShape(upstreamResponse?.data)
+                upstreamContentType: upstreamResponse?.headers?.['content-type'],
+                upstreamShape: summarizeEmbeddingsShape(upstreamResponse?.data),
+                coercedShape: summarizeEmbeddingsShape(coercedPayload.data),
+                parseError: coercedPayload.parseError
             });
             throw new Error('Unexpected embeddings response shape from upstream');
         }
@@ -2995,7 +3069,8 @@ app.post('/v1/embeddings', async (req, res) => {
             elapsedMs: Date.now() - requestStartedAt,
             model: payload.model,
             embeddingCount: payload.data.length,
-            usage: payload.usage
+            usage: payload.usage,
+            parsedFromString: coercedPayload.parsedFromString
         });
 
         return res.json(payload);
