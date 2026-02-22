@@ -30,6 +30,23 @@ jest.unstable_mockModule('axios', () => ({
                     return [];
                 })();
 
+                if (typeof body.model === 'string' && body.model.includes('gemini-embedding-001')) {
+                    return {
+                        data: {
+                            embeddings: sourceInputs.map((item, index) => ({
+                                values: [
+                                    typeof item === 'string' ? item.length / 10 : item.length,
+                                    index + 1,
+                                    0.5
+                                ],
+                                index
+                            })),
+                            model: body.model,
+                            metadata: { provider: 'google' }
+                        }
+                    };
+                }
+
                 return {
                     data: {
                         object: 'list',
@@ -527,6 +544,27 @@ describe('Proxy OpenAI API', () => {
             }),
             expect.any(Object)
         );
+    });
+
+    test('POST /v1/embeddings deve normalizar shape upstream com values (gemini)', async () => {
+        const res = await request(app)
+            .post('/v1/embeddings')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                model: 'google/gemini-embedding-001',
+                input: ['alpha', 'beta'],
+                encoding_format: 'base64'
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.body.object).toEqual('list');
+        expect(res.body.model).toEqual('google/gemini-embedding-001');
+        expect(res.body.data).toHaveLength(2);
+        expect(typeof res.body.data[0].embedding).toEqual('string');
+        expect(res.body.usage).toMatchObject({
+            prompt_tokens: expect.any(Number),
+            total_tokens: expect.any(Number)
+        });
     });
 
     test('POST /v1/responses deve suportar stream no formato responses', async () => {

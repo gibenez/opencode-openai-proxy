@@ -303,6 +303,10 @@ function isIntegerArray(value) {
     return Array.isArray(value) && value.every((item) => Number.isInteger(item));
 }
 
+function isNumberArray(value) {
+    return Array.isArray(value) && value.every((item) => typeof item === 'number' && Number.isFinite(item));
+}
+
 function normalizeEmbeddingsInput(input) {
     if (typeof input === 'string') {
         return { input };
@@ -372,6 +376,24 @@ function normalizeEmbeddingItem(rawItem, index) {
         };
     }
 
+    if (rawItem && typeof rawItem === 'object' && Object.prototype.hasOwnProperty.call(rawItem, 'values')) {
+        const rawIndex = Number.isInteger(rawItem.index) ? rawItem.index : index;
+        return {
+            object: 'embedding',
+            index: rawIndex,
+            embedding: rawItem.values
+        };
+    }
+
+    if (rawItem && typeof rawItem === 'object' && Object.prototype.hasOwnProperty.call(rawItem, 'vector')) {
+        const rawIndex = Number.isInteger(rawItem.index) ? rawItem.index : index;
+        return {
+            object: 'embedding',
+            index: rawIndex,
+            embedding: rawItem.vector
+        };
+    }
+
     if (Array.isArray(rawItem) || typeof rawItem === 'string') {
         return {
             object: 'embedding',
@@ -383,11 +405,69 @@ function normalizeEmbeddingItem(rawItem, index) {
     return null;
 }
 
-function normalizeEmbeddingsResponse(data, requestedModel, requestedInput) {
+function floatArrayToBase64(vector) {
+    const buffer = Buffer.allocUnsafe(vector.length * 4);
+    for (let i = 0; i < vector.length; i += 1) {
+        buffer.writeFloatLE(vector[i], i * 4);
+    }
+    return buffer.toString('base64');
+}
+
+function normalizeEmbeddingEncoding(embedding, requestedEncodingFormat) {
+    if (requestedEncodingFormat !== 'base64') {
+        return embedding;
+    }
+
+    if (typeof embedding === 'string') {
+        return embedding;
+    }
+
+    if (isNumberArray(embedding)) {
+        return floatArrayToBase64(embedding);
+    }
+
+    return embedding;
+}
+
+function summarizeEmbeddingsShape(data) {
+    if (!data || typeof data !== 'object') {
+        return { type: typeof data };
+    }
+
+    const topKeys = Object.keys(data);
+    const dataIsArray = Array.isArray(data.data);
+    const embeddingsIsArray = Array.isArray(data.embeddings);
+    const dataSampleKeys = dataIsArray && data.data[0] && typeof data.data[0] === 'object'
+        ? Object.keys(data.data[0])
+        : [];
+    const embeddingsSampleKeys = embeddingsIsArray && data.embeddings[0] && typeof data.embeddings[0] === 'object'
+        ? Object.keys(data.embeddings[0])
+        : [];
+
+    return {
+        topKeys,
+        dataIsArray,
+        dataLength: dataIsArray ? data.data.length : undefined,
+        dataSampleKeys,
+        embeddingsIsArray,
+        embeddingsLength: embeddingsIsArray ? data.embeddings.length : undefined,
+        embeddingsSampleKeys
+    };
+}
+
+function normalizeEmbeddingsResponse(data, requestedModel, requestedInput, requestedEncodingFormat) {
     const rawData = Array.isArray(data?.data)
         ? data.data
         : Array.isArray(data?.embeddings)
             ? data.embeddings
+            : data && typeof data === 'object' && data.data && typeof data.data === 'object'
+                ? [data.data]
+                : data && typeof data === 'object' && (
+                    Object.prototype.hasOwnProperty.call(data, 'embedding')
+                    || Object.prototype.hasOwnProperty.call(data, 'values')
+                    || Object.prototype.hasOwnProperty.call(data, 'vector')
+                )
+                    ? [data]
             : null;
 
     if (!rawData) {
@@ -395,7 +475,17 @@ function normalizeEmbeddingsResponse(data, requestedModel, requestedInput) {
     }
 
     const normalizedData = rawData
-        .map((item, index) => normalizeEmbeddingItem(item, index))
+        .map((item, index) => {
+            const normalized = normalizeEmbeddingItem(item, index);
+            if (!normalized) {
+                return null;
+            }
+
+            return {
+                ...normalized,
+                embedding: normalizeEmbeddingEncoding(normalized.embedding, requestedEncodingFormat)
+            };
+        })
         .filter(Boolean);
 
     if (normalizedData.length === 0) {
@@ -2888,10 +2978,15 @@ app.post('/v1/embeddings', async (req, res) => {
         const payload = normalizeEmbeddingsResponse(
             upstreamResponse?.data,
             normalizedModel,
-            normalizedInputResult.input
+            normalizedInputResult.input,
+            encodingFormat
         );
 
         if (!payload) {
+            debugLog('embeddings.response_shape.unrecognized', {
+                requestId,
+                upstreamShape: summarizeEmbeddingsShape(upstreamResponse?.data)
+            });
             throw new Error('Unexpected embeddings response shape from upstream');
         }
 
